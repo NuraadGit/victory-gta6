@@ -110,6 +110,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
+mod paired_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
@@ -463,6 +465,16 @@ pub fn emit(
                         }
                     }
                 }
+                // Two console lanes in each host lane: exact, no barriers, at twice the
+                // vector code (over half the threads).
+                // (`VICTORY_WAVE_PAIRS=0` turns it off.)
+                if std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0") {
+                    let again = paired(c, native, p);
+                    report("paired lanes", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 if strict {
                     break;
                 }
@@ -634,6 +646,21 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) from the console's own
+/// control flow, with two console lanes in each host lane ([`lower::with_paired_lanes`]).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let st = structure::structure_console(p)?;
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::can_pair(native, p, &st, &res)
+        .map_err(|(offset, what)| ShaderError::Unsupported { offset, what })?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.

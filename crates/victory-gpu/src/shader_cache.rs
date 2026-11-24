@@ -73,6 +73,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_WAVE_LOCAL",
                     "VICTORY_WAVE_LOOSE_LDS",
+                    "VICTORY_WAVE_PAIRS",
                     "VICTORY_F16_NEAREST",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());

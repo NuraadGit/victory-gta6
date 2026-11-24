@@ -187,6 +187,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Barriers made on this thread since a test cleared it: all, and those in entry blocks.
+    pub(super) static TEST_BARRIERS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -309,6 +315,11 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        #[cfg(test)]
+        if opcode == 80 {
+            let (all, entry) = TEST_BARRIERS.get();
+            TEST_BARRIERS.set((all + 1, entry + u32::from(block == self.entry)));
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);

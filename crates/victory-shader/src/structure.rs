@@ -469,8 +469,13 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
+    structured(program, wide, false)
+}
+
+fn structured(program: &Program, wide: &HashSet<usize>, console: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     l.wide = wide.clone();
+    l.console = console;
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -484,6 +489,27 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
         l.unresolved.extend(wrong);
         l.derived_phis.extend(new_derived);
         l.reset();
+    }
+}
+
+/// [`structure_wide`] with every branch on a lane mask the wave's: the console's own control
+/// flow, in which a lane is wherever its wave is. Refused where a branch is neither on a lane
+/// mask's test nor on scalars.
+///
+/// Two things [`structure`] takes for granted of a lane that decides alone do not hold of the
+/// wave, and are left out: that VCC's bits outside EXEC count for nothing at a `vccz` (the
+/// test is of the whole register), and that a count of "EXEC under a scalar condition" is not
+/// zero where the condition holds (EXEC may be empty in code that no branch skips).
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    let mut wide: HashSet<usize> = HashSet::new();
+    loop {
+        let st = structured(program, &wide, true)?;
+        let mut more: HashSet<usize> =
+            (0..st.exits.len()).filter(|&b| st.wave_any[b].is_some() && !wide.contains(&b)).collect();
+        if more.is_empty() {
+            return Ok(st);
+        }
+        wide.extend(more.drain());
     }
 }
 
@@ -532,6 +558,8 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// See [`Structured::wide`].
     wide: HashSet<usize>,
+    /// See [`structure_console`].
+    console: bool,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
     scc_every: HashSet<Value>,
@@ -615,6 +643,7 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             wide: HashSet::new(),
+            console: false,
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
         })
@@ -1246,7 +1275,8 @@ impl<'a> Lanes<'a> {
                 {
                     let e = exec.unwrap_or(Bool::TRUE);
                     let own = self.b.given(m, e);
-                    if self.b.implies(m, e)
+                    if !self.console
+                        && self.b.implies(m, e)
                         && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
                     {
                         self.scc_lane.insert(scc, own);
@@ -1333,7 +1363,7 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                let any = if self.console { vcc } else { self.b.and(vcc, exec) };
                 if n.ends_with("nz") {
                     any
                 } else {
