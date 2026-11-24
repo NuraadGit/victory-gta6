@@ -111,7 +111,7 @@ const TWO_PI: f32 = std::f32::consts::TAU;
 
 /// Blocks reached by every host lane: a fetch-inactive shuffle cannot
 /// recover registers of invocations absent from a divergent host branch.
-fn all_lane_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
+fn fetch_all_lane_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
     let exit_block = st.exits.len();
     let n = exit_block + 1;
     let mut successors = vec![Vec::new(); n];
@@ -7965,7 +7965,7 @@ impl<'a> Lower<'a> {
                 self.cross_lane(false)?;
                 let fetch_inactive = v.opsel & 1 != 0;
                 if fetch_inactive
-                    && !all_lane_blocks(self.x.p, self.x.st).is_some_and(|all| all[self.cur_ir])
+                    && !fetch_all_lane_blocks(self.x.p, self.x.st).is_some_and(|all| all[self.cur_ir])
                 {
                     // DXIL cannot read the last VGPR value of a host invocation
                     // that has left through a lane branch. A guard keeps it here.

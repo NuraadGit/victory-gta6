@@ -102,6 +102,8 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         static_samplers: Vec::new(),
         root_cbvs: result.root_cbvs,
         root_srvs: result.root_srvs,
+        root_uavs: result.root_uavs,
+        root_indexed_views: Vec::new(),
     };
     match validator::Validator::load(validator::Validator::default_path().as_deref()) {
         Ok(mut v) => {
