@@ -557,6 +557,44 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// The title addresses that show bytes `[offset, offset + len)` of `pages`:
+/// one `(address, bytes)` run for each mapped view of each run of them.
+fn showing(physical: &Physical, runs: &[(Slice, usize)], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut shown = Vec::new();
+    let (mut within, mut done) = (offset % PAGE, 0);
+    for (slice, n) in runs {
+        let k = (n * PAGE - within).min(len - done);
+        let (lo, hi) = (slice.index * PAGE + within, slice.index * PAGE + within + k);
+        for (&at, (bytes, view)) in &physical.views {
+            if !Arc::ptr_eq(&view.section, &slice.section) {
+                continue;
+            }
+            let (from, to) = (view.index * PAGE, view.index * PAGE + bytes);
+            let (a, b) = (lo.max(from), hi.min(to));
+            if a < b {
+                shown.push((at + (a - from), b - a));
+            }
+        }
+        (within, done) = (0, done + k);
+    }
+    shown
+}
+
+/// After a write into `pages` through a view of our own (DirectStorage's
+/// page destinations): the title's views of those pages saw no write, so
+/// the GPU side, which guards them, is told as for the title's kernel
+/// reads. Without it a buffer streamed in after its host copy was taken
+/// kept the copy's old bytes for good.
+pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else {
+        return;
+    };
+    let shown = showing(&physical(), &runs, offset, len);
+    for (at, bytes) in shown {
+        victory_gpu::title_memory_written(at, bytes);
+    }
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
@@ -1297,6 +1335,39 @@ mod tests {
             "unknown page"
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A write into physical pages reaches every view of them, and no view
+    /// of other pages.
+    #[test]
+    fn a_physical_write_names_the_views_that_show_it() {
+        let (a, b) = (allocate(4), allocate(1));
+        let slice = |page: usize| physical().pages.get(&page).cloned().expect("allocated");
+        let mut views = Physical::default();
+        // Pages 0..4 of `a` at A, pages 2..4 at B, and `b` at C.
+        let (at_a, at_b, at_c) = (0x7_0000_0000, 0x7_1000_0000, 0x7_2000_0000);
+        views.views.insert(at_a, (4 * PAGE, slice(a[0])));
+        views.views.insert(at_b, (2 * PAGE, slice(a[2])));
+        views.views.insert(at_c, (PAGE, slice(b[0])));
+        let shown = |pages: &[usize], offset: usize, len: usize| {
+            let runs = runs(pages, offset, len).expect("known pages");
+            let mut s = showing(&views, &runs, offset, len);
+            s.sort_unstable();
+            s
+        };
+        // 100 bytes 16 into the fourth page: in both views of it.
+        assert_eq!(shown(&a[3..], 16, 100), vec![(at_a + 3 * PAGE + 16, 100), (at_b + PAGE + 16, 100)]);
+        // The first two pages: only A shows them.
+        assert_eq!(shown(&a[..2], 0, 2 * PAGE), vec![(at_a, 2 * PAGE)]);
+        // From the middle of the second page into the third, across views.
+        assert_eq!(
+            shown(&a[1..3], PAGE / 2, PAGE),
+            vec![(at_a + PAGE + PAGE / 2, PAGE), (at_b, PAGE / 2)]
+        );
+        // Pages of two allocations: each run in its own views.
+        assert_eq!(shown(&[a[3], b[0]], PAGE - 8, 16), vec![(at_a + 4 * PAGE - 8, 8), (at_b + 2 * PAGE - 8, 8), (at_c, 8)]);
+        assert_eq!(XMemFreePhysicalPages(4, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 

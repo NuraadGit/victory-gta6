@@ -69,6 +69,13 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// For a copy in the PC's memory that shaders write through heap views
+    /// (whose writes stay in the copy): title memory's bytes as last copied,
+    /// by page, for the pages such views cover ([`Shadow::keep_reference`]).
+    /// A refresh of such a page takes only the bytes title memory changed
+    /// since ([`Shadow::copy_changed`]), not what shaders wrote beside them.
+    /// A copy in the card's memory has its CPU side for that.
+    refs: Mutex<BTreeMap<usize, Box<[u8]>>>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -1718,6 +1725,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            refs: Mutex::default(),
             window: false,
             place: None,
         }
@@ -2417,7 +2425,7 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2429,11 +2437,40 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let last_copied = *at;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                }
+                // A page shaders write through a heap view: the bytes title
+                // memory changed, not the whole page over what they wrote.
+                if last_copied != 0 && crate::watch::kept(page) {
+                    let (lo, hi) = ((page * PAGE).max(from).max(start), ((page + 1) * PAGE).min(to).min(end));
+                    if lo < hi
+                        && let Some(n) = self.copy_changed(page, lo, hi)
+                    {
+                        if let Some(first) = run.take() {
+                            bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                        }
+                        bytes += n;
+                        continue;
+                    }
+                }
+                // Written since only by the runtime through another view:
+                // those bytes alone, not what shaders left beside them.
+                if let Some(ranges) = crate::watch::exact_since(page, last_copied) {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    for (lo, hi) in ranges {
+                        let (lo, hi) = (lo.max(from), hi.min(to));
+                        if lo < hi {
+                            bytes += self.copy(lo, hi);
+                        }
+                    }
+                    continue;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -2447,6 +2484,91 @@ impl Shadow {
         bytes
     }
 
+    /// Of title memory `[lo, hi)` (inside page `page` and the buffer): the
+    /// bytes that changed since the page was last copied, into the copy;
+    /// the bytes changed. `None` if there is nothing to tell the change by
+    /// (the page is then copied whole).
+    fn copy_changed(&self, page: usize, lo: usize, hi: usize) -> Option<usize> {
+        if self.place.is_some() || self.window {
+            return None;
+        }
+        // A copy in the card's memory is refreshed this way only with
+        // `VICTORY_CARD_DIFF=1`: the merge of what the card wrote takes the
+        // CPU side for the card side as it was before the submission, and
+        // the two differ here (a title crash at world load).
+        static CARD_DIFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.card.is_some() && !*CARD_DIFF.get_or_init(|| std::env::var_os("VICTORY_CARD_DIFF").is_some_and(|v| v == "1")) {
+            return None;
+        }
+        let start = self.start as usize;
+        let mut title = vec![0u8; hi - lo];
+        if !crate::host::read_into(lo as *const u8, &mut title) {
+            return None;
+        }
+        let at = lo - start;
+        let mut changed = 0;
+        if self.card.is_some() {
+            // The CPU side holds title memory as last copied; the card's
+            // side, what shaders wrote too.
+            // SAFETY: inside the mapping of the copy's CPU side, which only
+            // the submitting thread writes.
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), hi - lo) };
+            for (r, m) in changed_runs(&title, held) {
+                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                self.changed(at + r, at + r + m);
+                self.card_changed(at + r, at + r + m);
+                changed += m;
+            }
+        } else {
+            let mut refs = self.refs.lock().unwrap_or_else(|e| e.into_inner());
+            let reference = refs.get_mut(&page)?;
+            let within = lo - page * PAGE;
+            let held = &mut reference[within..within + (hi - lo)];
+            for (r, m) in changed_runs(&title, held) {
+                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                // SAFETY: inside the copy's mapping. Shaders may be writing
+                // the copy beside these bytes; they are written here and
+                // nothing around them.
+                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                self.changed(at + r, at + r + m);
+                changed += m;
+            }
+        }
+        Some(changed)
+    }
+
+    /// Shaders may write `[address, address + len)` of this copy through a
+    /// heap view: for a copy in the PC's memory, keeps title memory's bytes
+    /// as last copied for its pages that have none yet, taken from the copy
+    /// (no shader has written them through such a view yet).
+    pub(crate) fn keep_reference(&self, address: usize, len: usize) {
+        /// The most bytes kept so, for all copies.
+        const MOST: u64 = 1 << 30;
+        static HELD: AtomicU64 = AtomicU64::new(0);
+        if self.card.is_some() || self.place.is_some() || self.window || len == 0 {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (lo, hi) = (address.max(start), address.saturating_add(len).min(end));
+        let mut refs = self.refs.lock().unwrap_or_else(|e| e.into_inner());
+        for page in lo / PAGE..hi.div_ceil(PAGE) {
+            if refs.contains_key(&page) {
+                continue;
+            }
+            if HELD.fetch_add(PAGE as u64, Ordering::Relaxed) >= MOST {
+                HELD.fetch_sub(PAGE as u64, Ordering::Relaxed);
+                return;
+            }
+            let mut reference = vec![0u8; PAGE].into_boxed_slice();
+            let (a, b) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            // SAFETY: inside the copy's mapping (`a` and `b` are within the
+            // buffer); a copy in the PC's memory, readable.
+            let from = unsafe { std::slice::from_raw_parts(self.data.add(a - start), b - a) };
+            reference[a - page * PAGE..b - page * PAGE].copy_from_slice(from);
+            refs.insert(page, reference);
+        }
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -2454,6 +2576,20 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // A kept reference takes the same bytes: the copy now holds them.
+        {
+            let mut refs = self.refs.lock().unwrap_or_else(|e| e.into_inner());
+            if !refs.is_empty() {
+                for page in from / PAGE..to.div_ceil(PAGE) {
+                    if let Some(reference) = refs.get_mut(&page) {
+                        let (a, b) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                        // SAFETY: inside the mapping, just written.
+                        let now = unsafe { std::slice::from_raw_parts(self.data.add(a - start), b - a) };
+                        reference[a - page * PAGE..b - page * PAGE].copy_from_slice(now);
+                    }
+                }
+            }
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);

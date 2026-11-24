@@ -46,6 +46,30 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Pages last written only by the runtime through another view of their
+    /// memory ([`title_memory_written`]): the bytes it wrote, so a copy takes
+    /// those and not the whole page, where shaders may have left results
+    /// title memory does not have (a heap view's writes stay in the copy).
+    exact: BTreeMap<usize, Exact>,
+}
+
+/// The runtime's writes into one page since its last whole-page write.
+struct Exact {
+    /// The asking of that whole-page write (0: none). A copy taken before it
+    /// takes the whole page.
+    since: u64,
+    /// `(asking, start, end)` of each write, addresses in the page.
+    writes: Vec<(u64, usize, usize)>,
+}
+
+/// More writes than this into one page and it is copied whole again.
+const EXACT_MAX: usize = 256;
+
+/// Page `page` was found written (all of it, as far as anyone knows) at
+/// asking `now`.
+fn note_written(j: &mut Journal, page: usize, now: u64) {
+    j.written.insert(page, now);
+    j.exact.remove(&page);
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -55,7 +79,34 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    exact: BTreeMap::new(),
 });
+
+/// Pages of title memory that shaders write through heap views, whose
+/// results stay in the host copies ([`shaders_keep`]).
+static KEPT: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+/// Whether shaders write page `page` through a heap view ([`shaders_keep`]).
+pub(crate) fn kept(page: usize) -> bool {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).contains(&page)
+}
+
+/// Shaders may write `[at, at + len)` through a heap view: what they write
+/// stays in the host copy, so a runtime write into these pages is copied
+/// where it wrote ([`title_memory_written`]), not as whole pages over it.
+pub(crate) fn shaders_keep(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let before = kept.len();
+    kept.extend(at / PAGE..at.saturating_add(len).div_ceil(PAGE));
+    let after = kept.len();
+    if after > before && (before == 0 || after.ilog2() > before.ilog2()) {
+        // The count passed a power of two.
+        tracing::info!(pages = after, "pages shaders write through heap views");
+    }
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -219,7 +270,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     j.asked += 1;
     let now = j.asked;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        note_written(&mut j, page, now);
     }
 }
 
@@ -276,7 +327,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        note_written(j, page, now);
     }
     true
 }
@@ -357,7 +408,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+        note_written(j, page, now);
     }
     Some((
         now,
@@ -586,6 +637,59 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// The runtime wrote title memory `[at, at + len)` through another view of
+/// its pages (the guards never see such a write): its pages count as
+/// written, so the copies of that memory take the new bytes, and only those
+/// bytes ([`exact_since`]). Opening the guards instead had every copy take
+/// the whole 64 KiB pages again, and with them title memory's stale bytes
+/// over what shaders had written beside the write through heap views:
+/// characters' clothes went missing. Unlike [`writing`] it leaves the
+/// texture slots alone: textures in such memory are hashed, not guarded.
+pub fn title_memory_written(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    if len == 0 {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        let before = j.written.insert(page, now).unwrap_or(0);
+        let exact = j.exact.entry(page).or_insert_with(|| Exact { since: before, writes: Vec::new() });
+        if exact.writes.len() >= EXACT_MAX {
+            // Copied whole from here on, as a page the title wrote.
+            j.exact.remove(&page);
+            continue;
+        }
+        exact.writes.push((now, at.max(page * PAGE), end.min((page + 1) * PAGE)));
+    }
+}
+
+/// For a page last copied at asking `after` (not 0) and written since: the
+/// address ranges written since, if only the runtime's writes through
+/// another view did ([`title_memory_written`]); `None` if the page is to be
+/// copied whole.
+pub(crate) fn exact_since(page: usize, after: u64) -> Option<Vec<(usize, usize)>> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let exact = j.exact.get(&page)?;
+    // A page no shader writes through a heap view is taken whole, as if the
+    // title had written it: the title may also have written it through yet
+    // another view, unseen. Asked at the copy, not at the write: a heap
+    // view made in between counts.
+    if !KEPT.lock().unwrap_or_else(|e| e.into_inner()).contains(&page) {
+        return None;
+    }
+    (after != 0 && after >= exact.since).then(|| {
+        exact
+            .writes
+            .iter()
+            .filter(|w| w.0 > after)
+            .map(|w| (w.1, w.2))
+            .collect()
+    })
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -719,6 +823,53 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn a_page_the_runtime_wrote_is_copied_where_it_wrote_until_a_whole_write() {
+        // Pages far from any other test's.
+        let page = 0x7_1234_0000 / PAGE;
+        let base = page * PAGE;
+        // An asking before, as there always is one before a copy (0 is
+        // "never copied").
+        JOURNAL.lock().unwrap().asked += 1;
+        shaders_keep(base, 2 * PAGE);
+        title_memory_written(base + 0x1000, 0x2000);
+        let first = JOURNAL.lock().unwrap().written[&page];
+        // A copy from before any write of the page takes it whole.
+        assert_eq!(exact_since(page, 0), None);
+        // A copy after it: nothing; one from just before: the bytes written.
+        assert_eq!(exact_since(page, first), Some(vec![]));
+        assert_eq!(exact_since(page, first - 1), Some(vec![(base + 0x1000, base + 0x3000)]));
+        // A write across the page's end is cut to each page.
+        title_memory_written(base + PAGE - 0x1000, 0x2000);
+        assert_eq!(
+            exact_since(page, first - 1),
+            Some(vec![(base + 0x1000, base + 0x3000), (base + PAGE - 0x1000, base + PAGE)])
+        );
+        assert_eq!(exact_since(page + 1, first), Some(vec![(base + PAGE, base + PAGE + 0x1000)]));
+        // The title writes the page (here: through a submission's copy):
+        // copied whole, for every copy, from then on.
+        {
+            let mut j = JOURNAL.lock().unwrap();
+            j.asked += 1;
+            let now = j.asked;
+            note_written(&mut j, page, now);
+        }
+        assert_eq!(exact_since(page, first), None);
+    }
+
+    #[test]
+    fn a_page_no_shader_writes_is_copied_whole_after_a_runtime_write() {
+        let page = 0x7_5678_0000 / PAGE;
+        JOURNAL.lock().unwrap().asked += 1;
+        let before = JOURNAL.lock().unwrap().asked;
+        title_memory_written(page * PAGE + 16, 32);
+        assert!(JOURNAL.lock().unwrap().written[&page] > before);
+        assert_eq!(exact_since(page, before), None);
+        // Until a heap view lets shaders write it: then only the bytes.
+        shaders_keep(page * PAGE, 1);
+        assert_eq!(exact_since(page, before), Some(vec![(page * PAGE + 16, page * PAGE + 48)]));
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

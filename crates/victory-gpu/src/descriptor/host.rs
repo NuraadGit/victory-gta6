@@ -1714,6 +1714,13 @@ fn buffer_uav(
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
+    // What shaders write here stays in the copy: a runtime write beside it
+    // is to be copied where it wrote, not as whole pages.
+    crate::watch::shaders_keep(address as usize, len as usize);
+    // Bisecting a title crash: no references for copies in the PC's memory.
+    if std::env::var_os("VICTORY_PC_REFERENCES").is_some() {
+        shadow.keep_reference(address as usize, len as usize);
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
