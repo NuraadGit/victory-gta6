@@ -7672,6 +7672,14 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double to a float, in integer arithmetic: the emitted
+                // DXIL has no doubles.
+                let x = self.src64(inst, 0)?;
+                let r = self.f64_bits_to_f32_bits(x);
+                let r = self.as_float(r);
+                float(self, r)
+            }
             "v_cvt_f32_f16" if v.opsel == 0 => {
                 let a = s(self, 0)?;
                 let r = self
@@ -7945,6 +7953,76 @@ impl<'a> Lower<'a> {
         let shift = self.s.m.int_const(ty, 32);
         let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
         self.s.m.bin(c, Bin::Or, lo, hi)
+    }
+
+    /// The f32 bits nearest to the f64 bits `x` (an i64), as
+    /// `v_cvt_f32_f64` gives them: rounded to nearest even, results below
+    /// the smallest normal kept as denormals, too big ones infinite, NaN
+    /// quiet with the sign kept.
+    fn f64_bits_to_f32_bits(&mut self, x: V) -> V {
+        let c = self.cur;
+        let t = self.s.m.int(64);
+        let k = |l: &mut Self, v: i64| l.s.m.int_const(t, v);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let (k23, k29, k31, k52, k63) = (k(self, 23), k(self, 29), k(self, 31), k(self, 52), k(self, 63));
+        let sign = self.s.m.bin(c, Bin::LShr, x, k63);
+        let sign = self.s.m.bin(c, Bin::Shl, sign, k31);
+        let e = self.s.m.bin(c, Bin::LShr, x, k52);
+        let m7ff = k(self, 0x7ff);
+        let e = self.s.m.bin(c, Bin::And, e, m7ff);
+        let mmask = k(self, (1 << 52) - 1);
+        let mant = self.s.m.bin(c, Bin::And, x, mmask);
+        // The mantissa with its implicit bit (none for zero and denormals).
+        let normal = self.s.m.cmp(c, pred::NE, e, zero);
+        let implicit = k(self, 1 << 52);
+        let full = self.s.m.bin(c, Bin::Or, mant, implicit);
+        let full = self.s.m.select(c, normal, full, mant);
+        // The float's exponent field, before rounding (signed).
+        let bias = k(self, 1023 - 127);
+        let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
+        // Bits shifted out: 29, and as many more as the result is below
+        // the smallest normal (at most 63).
+        let below = self.s.m.bin(c, Bin::Sub, one, e32);
+        let neg = self.s.m.cmp(c, pred::SLT, below, zero);
+        let below = self.s.m.select(c, neg, zero, below);
+        let shift = self.s.m.bin(c, Bin::Add, k29, below);
+        let over = self.s.m.cmp(c, pred::SGT, shift, k63);
+        let shift = self.s.m.select(c, over, k63, shift);
+        // Exponent field minus one, plus the shifted mantissa whose
+        // implicit bit adds the one back (none for a denormal result).
+        let em1 = self.s.m.bin(c, Bin::Sub, e32, one);
+        let neg = self.s.m.cmp(c, pred::SLT, em1, zero);
+        let em1 = self.s.m.select(c, neg, zero, em1);
+        let base = self.s.m.bin(c, Bin::Shl, em1, k23);
+        let kept = self.s.m.bin(c, Bin::LShr, full, shift);
+        let r = self.s.m.bin(c, Bin::Add, base, kept);
+        // Round to nearest even; a carry into the exponent is right, up to
+        // infinity.
+        let unit = self.s.m.bin(c, Bin::Shl, one, shift);
+        let low = self.s.m.bin(c, Bin::Sub, unit, one);
+        let rest = self.s.m.bin(c, Bin::And, full, low);
+        let shift1 = self.s.m.bin(c, Bin::Sub, shift, one);
+        let half = self.s.m.bin(c, Bin::Shl, one, shift1);
+        let above = self.s.m.cmp(c, pred::IUGT, rest, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rest, half);
+        let odd = self.s.m.bin(c, Bin::And, r, one);
+        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+        let tie = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie);
+        let up = self.s.m.cast(c, Cast::ZExt, up, t);
+        let r = self.s.m.bin(c, Bin::Add, r, up);
+        // Too big: infinity. Infinity and NaN in: infinity, or a quiet NaN.
+        let k255 = k(self, 255);
+        let inf = k(self, 0x7f80_0000);
+        let huge = self.s.m.cmp(c, pred::SGE, e32, k255);
+        let r = self.s.m.select(c, huge, inf, r);
+        let special = self.s.m.cmp(c, pred::EQ, e, m7ff);
+        let nan = self.s.m.cmp(c, pred::NE, mant, zero);
+        let qnan = k(self, 0x7fc0_0000);
+        let s_val = self.s.m.select(c, nan, qnan, inf);
+        let r = self.s.m.select(c, special, s_val, r);
+        let r = self.s.m.bin(c, Bin::Or, r, sign);
+        self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32)
     }
 
     /// The low and high dwords of an i64.

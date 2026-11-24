@@ -476,6 +476,60 @@ fn v_cmp_lg_is_false_for_nan() {
 }
 
 #[test]
+fn v_cvt_f32_f64_rounds_like_the_hardware() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f): the double's low dword
+    // is input 0, its high dword input 1.
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let doubles: Vec<f64> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        0.1,
+        1.0 / 3.0,
+        // Ties: to even, down and up.
+        1.0 + 2f64.powi(-24),
+        1.0 + 3.0 * 2f64.powi(-24),
+        // Just past a tie rounds up.
+        1.0 + 2f64.powi(-24) + 2f64.powi(-40),
+        // The largest float, and past it: infinity.
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * 1.000_000_1,
+        1e300,
+        -1e300,
+        // Denormal results, and ones that round to the smallest normal.
+        1e-40,
+        -3e-42,
+        f64::from(f32::MIN_POSITIVE) * (1.0 - 2f64.powi(-25)),
+        1.4e-45,
+        7e-46,
+        1e-50,
+        // Double denormals: zero.
+        5e-320,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let mut inputs: Vec<[u32; 4]> = doubles
+        .iter()
+        .map(|d| {
+            let b = d.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    // A NaN, kept a NaN.
+    inputs.push([1, 0x7ff0_0000, 0, 0]);
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let d = f64::from_bits(u64::from(inp[0]) | u64::from(inp[1]) << 32);
+        if d.is_nan() {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: v_cvt_f32_f64(NaN) = {got:#010x}");
+            return;
+        }
+        let want = (d as f32).to_bits();
+        assert_eq!(got, want, "{backend}: case {i}: v_cvt_f32_f64({d:e}) = {got:#010x}, want {want:#010x}");
+    });
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);
