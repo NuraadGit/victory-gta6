@@ -90,6 +90,13 @@ enum Command {
         /// after every new build, with the same VICTORY_* settings).
         #[arg(long)]
         warm: bool,
+        /// `--warm-list`: warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        #[arg(long)]
+        warm_list: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -159,6 +166,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            warm_list,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -169,6 +177,9 @@ fn main() -> Result<()> {
             let host_wave = |name| std::env::var(name).ok().and_then(|v| v.parse().ok());
             if let Some(n) = host_wave("VICTORY_HOST_WAVE").or_else(|| host_wave("VICTORY_HOST_MAX_WAVE")) {
                 victory_shader::emit::set_host_max_wave(n);
+            }
+            if let Some(file) = warm_list {
+                return translate::warm(paths, &file, jobs);
             }
             if warm && victory_shader::emit::host_max_wave() == 0 {
                 // Unset: this PC's GPU decides, as it does for the run.
