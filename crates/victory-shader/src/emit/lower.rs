@@ -2183,7 +2183,7 @@ impl<'a> Lower<'a> {
                 if !self.vals.per_lane.contains(&w) {
                     continue;
                 }
-                let alike = matches!(shape, Some(super::wave::Shape::Active(..) | super::wave::Shape::K(_)));
+                let alike = matches!(shape, Some(super::wave::Shape::Active(..) | super::wave::Shape::CountF64High(_) | super::wave::Shape::K(_)));
                 if alike && let Some(&val) = self.vals.maps[0].get(&w) {
                     self.vals.insert(w, val);
                     continue;
@@ -2215,6 +2215,33 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::CountF64High(mask) => {
+                // Use the console mask's two dwords, including the other host half.
+                // mask_dword retains its existing reachability/exchange checks.
+                if self.mask_data != MaskData::Console || self.local || LOOSE_LDS.get() {
+                    return Err("an exact f64 population sum without console masks");
+                }
+                let c = self.cur;
+                let i32t = self.s.t.i32;
+                let a = self.mask_dword(mask)?;
+                let high = self.x.st.highs.iter().find(|h| *h.1 == mask).map(|h| *h.0);
+                let b = match high {
+                    Some(v) => self.mask_dword(v)?,
+                    // A wave64 count without its high half would count half the wave.
+                    None if self.x.native.wave64 => return Err("an f64 population sum without its mask's high half"),
+                    None => self.s.m.i32(0),
+                };
+                let a = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
+                let b = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+                let n = self.s.m.bin(c, Bin::Add, a, b);
+                let f = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
+                let bits = self.as_int(f);
+                let (three, bias, zero) = (self.s.m.i32(3), self.s.m.i32(0x3800_0000), self.s.m.i32(0));
+                let hi = self.s.m.bin(c, Bin::LShr, bits, three);
+                let hi = self.s.m.bin(c, Bin::Add, hi, bias);
+                let nonzero = self.s.m.cmp(c, pred::NE, n, zero);
+                return Ok(self.s.m.select(c, nonzero, hi, zero));
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;

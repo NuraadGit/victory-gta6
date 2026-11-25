@@ -104,6 +104,8 @@ pub(crate) enum Sym {
     Own(Value),
     /// A uniform value from before the section.
     Uni(Value),
+    /// High dword of an exact f64 sum of masked ones; its low dword is zero.
+    CountF64High { mask: Value, lanes: u64 },
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
     Red {
         op: Option<Op>,
@@ -119,6 +121,8 @@ pub(crate) enum Sym {
 pub(crate) enum Shape {
     K(u32),
     Value(Value),
+    /// High dword of f64(popcount(mask)); counts up to 64 are exact.
+    CountF64High(Value),
     /// The lane's own `mask ? src : ident`.
     Masked(Value, Value, u32),
     /// `op` over every lane.
@@ -169,7 +173,25 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        // These constants were written in every lane the saved EXEC contains.
+        // Do not infer constants for inactive VGPR lanes or across a mask change.
+        let constants = insts[..i].iter().filter_map(|def| {
+            let Fields::Valu(v) = &def.fields else { return None };
+            if def.name() != "v_mov_b32" || v.dpp.is_some() || v.sdwa.is_some()
+                || v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0
+                || [EXEC, EXEC + 1].iter().any(|&r| def.read(Reg::S(r)) != inst.read(Reg::S(r)))
+            {
+                return None;
+            }
+            let k = match *v.src.first()? {
+                Operand::Const(c) => crate::resource::inline(c)?,
+                Operand::Literal(k) => k,
+                _ => return None,
+            };
+            let Operand::Vector { reg, .. } = v.dst? else { return None };
+            Some((def.write(Reg::V(reg))?, k))
+        }).collect();
+        let shapes = simulate(&insts[i + 1..end], wave, saved, &constants);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
@@ -257,7 +279,25 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+// Only the compiler's f64 population sum is modelled, not general double arithmetic.
+fn count_f64(lo: Sym, hi: Sym, constants: &HashMap<Value, u32>) -> Option<(Value, u64)> {
+    let zero = match lo {
+        Sym::K(0) => true,
+        Sym::Red { op: None, src, ident: 0, .. } => constants.get(&src) == Some(&0),
+        _ => false,
+    };
+    if !zero { return None; }
+    match hi {
+        Sym::CountF64High { mask, lanes } => Some((mask, lanes)),
+        Sym::Red { op: None, src, mask, ident: 0, lanes }
+            if constants.get(&src) == Some(&0x3FF0_0000) => Some((mask, lanes)),
+        _ => None,
+    }
+}
+
+fn simulate(
+    insts: &[Inst], wave: u32, saved: Value, constants: &HashMap<Value, u32>,
+) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -298,12 +338,20 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            // Scalar copies of a readlane result still hold that result.
+            if name == "s_mov_b32"
+                && let (Some(Operand::Scalar { code: to, .. }), Some(Operand::Scalar { code: from, .. })) =
+                    (*dst, src.first())
+                && let (Some(w), Some(r)) = (inst.write(Reg::S(to)), inst.read(Reg::S(*from)))
+            {
+                uni.insert(w, uni.get(&r).copied().unwrap_or(Sym::Uni(r)));
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -368,6 +416,42 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         let Some(dst) = inst.write(Reg::V(dreg)) else {
             continue;
         };
+        if name == "v_add_f64" {
+            let high = |op: &Operand| match *op {
+                Operand::Vector { reg, .. } => Some(Operand::Vector { reg: reg.checked_add(1)?, dwords: 1 }),
+                Operand::Scalar { code, .. } if code != NULL => Some(Operand::Scalar { code: code.checked_add(1)?, dwords: 1 }),
+                _ => None,
+            };
+            let pair = |k: usize| {
+                let op = v.src.get(k)?;
+                Some((lanes(op, &vec, &uni), lanes(&high(op)?, &vec, &uni)))
+            };
+            let mut result = [vec![Sym::Unknown; wave as usize], vec![Sym::Unknown; wave as usize]];
+            if !modifiers && v.dpp.is_none()
+                && let (Some((al, ah)), Some((bl, bh))) = (pair(0), pair(1))
+            {
+                for l in 0..wave as usize {
+                    if let (Some((ma, a)), Some((mb, b))) =
+                        (count_f64(al[l], ah[l], constants), count_f64(bl[l], bh[l], constants))
+                        && ma == mb && a & b == 0
+                    {
+                        result[0][l] = Sym::K(0);
+                        result[1][l] = Sym::CountF64High { mask: ma, lanes: a | b };
+                    }
+                }
+            }
+            for (k, mut value) in result.into_iter().enumerate() {
+                let reg = dreg + k as u8;
+                if let Some(w) = inst.write(Reg::V(reg)) {
+                    let old = lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni);
+                    for l in 0..wave as usize {
+                        if exec >> l & 1 == 0 { value[l] = old[l]; }
+                    }
+                    vec.insert(w, value);
+                }
+            }
+            continue;
+        }
         let old = lanes(
             &Operand::Vector {
                 reg: dreg,
@@ -553,6 +637,7 @@ fn shapes(
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::CountF64High { mask, lanes } if lanes == all => Some(Shape::CountF64High(mask)),
         Sym::Red {
             op: Some(op),
             src,
@@ -596,6 +681,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
             Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::CountF64High { mask, lanes } if lanes == all => Some(Shape::CountF64High(mask)),
             Sym::Red {
                 op: Some(op),
                 src,
@@ -686,6 +772,42 @@ pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
     0xBEFE_0404, // s_mov_b64 exec, s[4:5]
 ];
 
+/// An exact f64 count of the lanes selected by VCC, copied into s[12:13].
+#[cfg(test)]
+pub(super) const WAVE_COUNT_F64_TO_S12_S13: &[u32] = &[
+    0x7E26_0280, // v_mov_b32 v19, 0
+    0x7E28_02FF, 0x3FF0_0000, // v_mov_b32 v20, lit(0x3ff00000)
+    0xBE86_25C1, // s_or_saveexec_b64 s[6:7], -1
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7E06_0280, // v_mov_b32 v3, 0
+    0x8788_066A, // s_and_b64 s[8:9], vcc, s[6:7]
+    0xD501_0002, 0x0022_2702, // v_cndmask_b32 v2, v2, v19, s[8:9]
+    0xD501_0003, 0x0022_2903, // v_cndmask_b32 v3, v3, v20, s[8:9]
+    0x7E08_02E9, 0xDE54_C102, // v_mov_b32 v4, v2 dpp8:[1,0,3,2,5,4,7,6]
+    0x7E0A_02E9, 0xDE54_C103, // v_mov_b32 v5, v3 dpp8:[1,0,3,2,5,4,7,6]
+    0xD564_0002, 0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02E9, 0x9360_1202, // v_mov_b32 v4, v2 dpp8:[2,2,0,0,6,6,4,4]
+    0x7E0A_02E9, 0x9360_1203, // v_mov_b32 v5, v3 dpp8:[2,2,0,0,6,6,4,4]
+    0xD564_0002, 0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02E9, 0x0009_2402, // v_mov_b32 v4, v2 dpp8:[4,4,4,4,0,0,0,0]
+    0x7E0A_02E9, 0x0009_2403, // v_mov_b32 v5, v3 dpp8:[4,4,4,4,0,0,0,0]
+    0xD564_0002, 0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02FA, 0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+    0x7E0A_02FA, 0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+    0xD564_0002, 0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0xD778_0004, 0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+    0xD778_0005, 0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+    0xD564_0002, 0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0xD760_0008, 0x0001_4102, // v_readlane_b32 s8, v2, 32
+    0xD760_0009, 0x0001_4103, // v_readlane_b32 s9, v3, 32
+    0xD564_0002, 0x0002_0408, // v_add_f64 v[2:3], s[8:9], v[2:3]
+    0xD760_0008, 0x0001_0102, // v_readlane_b32 s8, v2, 0
+    0xD760_0009, 0x0001_0103, // v_readlane_b32 s9, v3, 0
+    0xBE8C_0308, // s_mov_b32 s12, s8
+    0xBE8D_0309, // s_mov_b32 s13, s9
+    0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +849,40 @@ mod tests {
             .flat_map(u32::to_le_bytes)
             .collect();
         crate::ir::build(&code, wave64, 256).unwrap()
+    }
+
+    #[test]
+    fn a_masked_f64_sum_of_ones_is_an_exact_population_count() {
+        let p = build(WAVE_COUNT_F64_TO_S12_S13, true);
+        let sec = &sections(&p, 0)[&2];
+        let at = |name: &str, reg| p.blocks[0].insts.iter()
+            .filter(|i| i.name() == name).find_map(|i| i.write(reg)).unwrap();
+        let mask = at("s_and_b64", Reg::S(8));
+        assert_eq!(sec.shapes.get(&at("s_mov_b32", Reg::S(12))), Some(&Shape::K(0)));
+        assert_eq!(sec.shapes.get(&at("s_mov_b32", Reg::S(13))), Some(&Shape::CountF64High(mask)));
+    }
+
+    #[test]
+    fn a_f64_population_count_requires_ones_and_disjoint_lane_sets() {
+        for (from, to) in [
+            (0x3FF0_0000, 0x4000_0000), // 2.0 instead of 1.0
+            (0x7E26_0280, 0x7E26_0281), // nonzero low word
+            (0x0002_0408, 0x0002_0502), // the same partial sum twice
+        ] {
+            let words: Vec<_> = WAVE_COUNT_F64_TO_S12_S13.iter()
+                .map(|&w| if w == from { to } else { w }).collect();
+            assert!(words != WAVE_COUNT_F64_TO_S12_S13);
+            let p = build(&words, true);
+            let high = p.blocks[0].insts.iter().find(|i| i.write(Reg::S(13)).is_some()).unwrap()
+                .write(Reg::S(13)).unwrap();
+            assert!(!sections(&p, 0)[&2].shapes.contains_key(&high));
+        }
+        // A constant written under another EXEC is not known in the saved lanes.
+        let mut p = build(WAVE_COUNT_F64_TO_S12_S13, true);
+        let read = p.blocks[0].insts[1].reads.iter_mut().find(|r| r.0 == Reg::S(EXEC)).unwrap();
+        read.1 = Value(u32::MAX);
+        let high = p.blocks[0].insts.iter().find_map(|i| i.write(Reg::S(13))).unwrap();
+        assert!(!sections(&p, 0)[&2].shapes.contains_key(&high));
     }
 
     #[test]

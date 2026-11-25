@@ -485,3 +485,28 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// The whole-wave double sum that normalizes the slice stores: compile and validate
+/// without dispatching work on the GPU. Cross-half counts must retain all 64 lanes.
+#[test]
+fn a_masked_f64_population_count_lowers_on_a_32_lane_host() {
+    let mut words = vec![0x7D88_0000]; // v_cmp_gt_u32 vcc, s0, v0
+    words.extend_from_slice(super::wave::WAVE_COUNT_F64_TO_S12_S13);
+    words.extend_from_slice(&[
+        0xF408_0202, 0xFA00_0000, // reload s[8:11], clobbered by the count
+        0x7E0A_1E0C, // v_cvt_f32_f64 v5, s[12:13]
+        0xE070_0000, 0x8002_0500, // buffer_store_dword v5, off, s[8:11], 0
+    ]);
+    let mut native = native(&words);
+    native.vgprs = 32;
+    let p = ir::build(&native.code, true, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+        eprintln!("validated the f64 population count on a 32-lane host");
+    }
+    for count in 0..=64u32 {
+        let high = if count == 0 { 0 } else { ((count as f32).to_bits() >> 3) + 0x3800_0000 };
+        assert_eq!((u64::from(high) << 32), (count as f64).to_bits());
+    }
+}
