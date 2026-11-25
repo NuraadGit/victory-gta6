@@ -43,6 +43,7 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+mod launch;
 #[cfg(windows)]
 mod pip;
 pub mod list;
