@@ -7115,6 +7115,9 @@ struct Presenter {
     /// The size last given to `SetSourceSize` (the part of the back
     /// buffer shown).
     source: (u32, u32),
+    /// Lazily initialized, including a cached failure. Only VICTORY_PIP=1
+    /// creates descriptors/shaders; its presents are waited for.
+    pip: Option<Option<crate::pip::Pass>>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -7410,6 +7413,7 @@ impl Host {
         state: u32,
         frame: u64,
         rect: Option<[u32; 4]>,
+        pip_target: Option<crate::pip::Target>,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -7457,6 +7461,11 @@ impl Host {
             }
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
+        // Our single PiP descriptor pair must not still be read by the GPU.
+        // Also finish prior title work before reading a target's tracked state.
+        if crate::pip::enabled() {
+            settle_now(WHY_SYNC);
+        }
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -7470,7 +7479,7 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let slot = if late_free_present() && !read_now && !crate::pip::enabled() {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -7534,14 +7543,32 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            // Restore the final source before PiP: it can itself be selected.
+            // Preserve the original barrier batch when the feature is off.
+            if crate::pip::enabled() {
+                list.ResourceBarrier(&[transition(
+                    texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state,
+                )]);
+                let mut back_state = D3D12_RESOURCE_STATE_COPY_DEST;
+                if let Some(target) = &pip_target
+                    && let Some(pass) = p.pip.get_or_insert_with(|| crate::pip::Pass::new(self))
+                    && pass.record(self, copy, target, &back, shown, (texture, state))
+                {
+                    back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                }
+                list.ResourceBarrier(&[transition(
+                    &back, back_state, D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -7613,6 +7640,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 source: (width, height),
+                pip: None,
             })
         }
     }

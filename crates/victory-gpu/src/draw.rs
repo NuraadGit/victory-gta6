@@ -626,6 +626,7 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            crate::pip::note_target(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             self.formats.target(rtvs.len(), record.desc().map(|d| d.Format), texture);
@@ -636,6 +637,7 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            crate::pip::note_target(record.resource);
             self.formats.depth(record.depth_desc().map(|d| d.Format), texture);
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
@@ -3427,6 +3429,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            crate::pip::note_target(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.

@@ -944,6 +944,8 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    let pip_target = crate::pip::begin_present();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -996,7 +998,7 @@ extern "system" fn present(
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let rect = source_rect(plane, desc.Width, desc.Height);
-        let shown = host.present(texture, state, frame, rect);
+        let shown = host.present(texture, state, frame, rect, pip_target);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -1005,6 +1007,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    crate::pip::end_present();
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
