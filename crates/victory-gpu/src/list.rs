@@ -678,7 +678,10 @@ pub(crate) struct Barrier {
 }
 
 /// The barrier on host resources, or `None` if it names a resource the host
-/// GPU does not have (buffers so far).
+/// GPU does not have (buffers so far). An aliasing barrier is one on any
+/// placed resource: the resources it names may have no host texture, or a
+/// committed one, and the host heaps' aliases are tracked as lists use them
+/// (`crate::alias`).
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
@@ -702,6 +705,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(texture, wanted)),
             })
         }
+        1 if crate::alias::enabled() => Some(Barrier {
+            kind: 1,
+            flags: 0,
+            first: std::ptr::null(),
+            second: 0,
+            last: 0,
+        }),
         1 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
@@ -780,6 +790,30 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
     }
     0
+}
+
+/// `DiscardResource(resource, region)`: a render target or depth texture
+/// in a host heap (`crate::alias`) is discarded on the host too, in the
+/// state that takes that, over the title's region (rectangles and
+/// subresources, laid out as the host's). Others keep their contents (the
+/// host needs no discard to use them).
+extern "system" fn discard(this: This, resource: This, region: *const std::ffi::c_void) {
+    #[cfg(windows)]
+    if crate::alias::enabled()
+        && let Some(list) = host_list(this)
+        && let Some(copy) = crate::resource::host_copy(resource)
+        && let Some(state) = crate::alias::discard_state(&copy)
+    {
+        ensure_state(list, resource, state);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("discard {resource:?}"));
+        let region = (!region.is_null()).then(|| region.cast());
+        // SAFETY: an open list, a live texture in the state a discard takes;
+        // the title's region or none.
+        unsafe { list.list.DiscardResource(&copy.texture, region) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, resource, region);
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -2119,7 +2153,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 10] = [
+    (55, discard as *const ()),                // 0x1b8 DiscardResource
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
@@ -2184,6 +2219,13 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn discard_is_wired_in_both_console_list_tables() {
+        for newer in [false, true] {
+            assert_eq!(list_table(newer)[0x1b8 / 8], discard as *const ());
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

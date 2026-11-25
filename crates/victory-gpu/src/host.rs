@@ -737,6 +737,8 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Recorded uses of textures sharing host heap memory.
+    aliases: Mutex<crate::alias::ListAliases>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -3674,6 +3676,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                aliases: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -5766,7 +5769,14 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.aliases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5803,38 +5813,43 @@ impl HostList {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
-            }
-        }
+        self.track(&copy, wanted).map(|before| (texture, before))
     }
 
-    /// Moves host texture `copy` to `wanted` (a host state) in this list,
-    /// as [`HostList::transition`] does a title resource's host copy, and
-    /// records the barrier: for textures that are not a title resource's
-    /// host copy (colour twins) and for the copies between the two.
-    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
+    /// Tracks state and records an alias barrier and RT/DS discard at an in-list handoff.
+    fn track(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+        let (left, now) = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy.clone()));
-                None
+                (None, wanted)
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                ((before != wanted).then_some(before), before)
             }
         };
         drop(states);
-        if let Some(before) = before {
+        if copy.placement.is_some()
+            && self
+                .aliases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .use_texture(copy)
+        {
+            crate::alias::initialize(&self.list, copy, now, true);
+        }
+        left
+    }
+
+    /// Moves a host copy (including depth twins) and records its state barrier.
+    fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        let wanted = legal_state(&copy.texture, wanted);
+        if let Some(before) = self.track(copy, wanted) {
             let barrier = transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -6037,6 +6052,15 @@ impl HostList {
             u.twin.behind.store(left, Ordering::Relaxed);
         }
         drop(twins);
+        let (alias, discards) =
+            crate::alias::at_submission(&self.aliases.lock().unwrap_or_else(|e| e.into_inner()));
+        let discards: Vec<_> = discards
+            .into_iter()
+            .map(|t| {
+                let real = t.state.load(Ordering::Relaxed);
+                (t, real)
+            })
+            .collect();
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
@@ -6075,7 +6099,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && !alias && discards.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6090,6 +6114,12 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if alias && discards.is_empty() {
+                    list.ResourceBarrier(&[crate::alias::any_alias()]);
+                }
+                for (i, (t, real)) in discards.iter().enumerate() {
+                    crate::alias::initialize(list, t, *real, alias && i == 0);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -7275,6 +7305,7 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            crate::alias::log();
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
