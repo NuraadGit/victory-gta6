@@ -258,6 +258,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
+fn dry() -> bool {
+    static DRY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DRY.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BACK_DRY").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
@@ -301,7 +306,11 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    // VICTORY_TEXTURE_BACK_DRY=1: the copies run and are tiled, the title's
+    // memory is left as it was (does the copy or the title's use of it hang?).
+    if !dry() {
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    }
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
