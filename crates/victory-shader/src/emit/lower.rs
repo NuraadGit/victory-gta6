@@ -2215,11 +2215,46 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::CountF64High(mask) if self.paired.is_some() => {
+                // Paired lanes: this host wave is the whole console wave, each host lane
+                // holding console lanes n and n + 32; the count is both halves' ballots.
+                let c = self.cur;
+                let i32t = self.s.t.i32;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.both_halves(|l| l.boolean(m, c))?;
+                let mut n = self.s.m.i32(0);
+                for bit in on {
+                    let ballot = self.ballot32(c, bit);
+                    let k = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[ballot]);
+                    n = self.s.m.bin(c, Bin::Add, n, k);
+                }
+                return Ok(self.f64_count_high(n));
+            }
             Shape::CountF64High(mask) => {
                 // Use the console mask's two dwords, including the other host half.
                 // mask_dword retains its existing reachability/exchange checks.
                 if self.mask_data != MaskData::Console || self.local || LOOSE_LDS.get() {
-                    return Err("an exact f64 population sum without console masks");
+                    // Local waves (approximate, as their other reductions): the count of this
+                    // host wave's lanes, as the HLSL wave sum the compiler expanded gives on
+                    // a host of this wave size; the values it normalizes are summed over the
+                    // same host wave.
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let &m = self
+                        .x
+                        .st
+                        .masks
+                        .get(&mask)
+                        .ok_or("a wave reduction's untracked mask")?;
+                    let on = self.boolean(m, c)?;
+                    let ballot = self.ballot32(c, on);
+                    let n = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[ballot]);
+                    return Ok(self.f64_count_high(n));
                 }
                 let c = self.cur;
                 let i32t = self.s.t.i32;
@@ -2234,13 +2269,7 @@ impl<'a> Lower<'a> {
                 let a = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
                 let b = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
                 let n = self.s.m.bin(c, Bin::Add, a, b);
-                let f = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
-                let bits = self.as_int(f);
-                let (three, bias, zero) = (self.s.m.i32(3), self.s.m.i32(0x3800_0000), self.s.m.i32(0));
-                let hi = self.s.m.bin(c, Bin::LShr, bits, three);
-                let hi = self.s.m.bin(c, Bin::Add, hi, bias);
-                let nonzero = self.s.m.cmp(c, pred::NE, n, zero);
-                return Ok(self.s.m.select(c, nonzero, hi, zero));
+                return Ok(self.f64_count_high(n));
             }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
@@ -2418,6 +2447,19 @@ impl<'a> Lower<'a> {
     /// [`Self::shape`]'s reductions and prefixes with pairs: each half's lanes reduced over the
     /// host wave, then the two results. A prefix of the upper half's lane starts from the
     /// lower half's total.
+    /// The high dword of f64(`n`) for a lane count `n` <= 64 (its low dword is 0):
+    /// `(bits(f32(n)) >> 3) + 0x38000000`, 0 for `n` = 0.
+    fn f64_count_high(&mut self, n: V) -> V {
+        let c = self.cur;
+        let f = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
+        let bits = self.as_int(f);
+        let (three, bias, zero) = (self.s.m.i32(3), self.s.m.i32(0x3800_0000), self.s.m.i32(0));
+        let hi = self.s.m.bin(c, Bin::LShr, bits, three);
+        let hi = self.s.m.bin(c, Bin::Add, hi, bias);
+        let nonzero = self.s.m.cmp(c, pred::NE, n, zero);
+        self.s.m.select(c, nonzero, hi, zero)
+    }
+
     fn pair_shape(
         &mut self,
         op: super::wave::Op,
