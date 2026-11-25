@@ -440,18 +440,26 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 
 fn guards() -> Held {
     let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-    // (`try_with`: a thread on its way out, its locals gone, still faults
-    // into the handler, which takes the guards)
-    let _ = HOLDING.try_with(|h| h.set(true));
+    HOLDER.store(this_thread(), std::sync::atomic::Ordering::Release);
     Held(g)
 }
 
-thread_local! {
-    /// This thread holds [`GUARDS`] ([`Held`]).
-    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Blocks [`install`]'s handler opened on this thread while it held
-    /// [`GUARDS`]: noted as opened when the lock is given back.
-    static OPENED_HELD: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+/// The thread that holds [`GUARDS`] (0: none). Not a thread-local: the
+/// handler runs on threads still being set up (an allocation of their TLS
+/// faults on a guarded heap block) or on their way out, and a thread-local
+/// touched there faults or panics in turn.
+static HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Blocks the handler opened while their thread held [`GUARDS`], plus one
+/// (0: empty), settled when the lock is given back ([`Held`]). Fixed slots:
+/// the handler must not allocate.
+static OPENED_HELD: [std::sync::atomic::AtomicUsize; 1024] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+static OPENED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn this_thread() -> u32 {
+    // SAFETY: no arguments; reads the thread's own id from its TEB.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
 }
 
 /// [`GUARDS`] held by this thread. A write fault taken while it is held (an
@@ -475,12 +483,22 @@ impl std::ops::DerefMut for Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let opened = OPENED_HELD.try_with(|o| std::mem::take(&mut *o.borrow_mut())).unwrap_or_default();
-        for block in opened {
-            self.0.protected.remove(&block);
-            self.0.clean.remove(&block);
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        let n = OPENED_COUNT.swap(0, AcqRel);
+        for slot in OPENED_HELD.iter().take(n) {
+            let block = slot.swap(0, AcqRel);
+            if block != 0 {
+                self.0.protected.remove(&(block - 1));
+                self.0.clean.remove(&(block - 1));
+            }
         }
-        let _ = HOLDING.try_with(|h| h.set(false));
+        if n > OPENED_HELD.len() {
+            // More than the slots hold: which blocks is not known. Every
+            // block is guarded afresh (and taken as written once).
+            self.0.protected.clear();
+            self.0.clean.clear();
+        }
+        HOLDER.store(0, Release);
     }
 }
 
@@ -824,7 +842,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        if HOLDING.try_with(|h| h.get()).unwrap_or(false) {
+        if HOLDER.load(std::sync::atomic::Ordering::Acquire) == this_thread() {
             // This thread holds the guards (a fault inside a copy's own
             // work): a block it made read-only is opened here, without the
             // lock, and noted when the lock is given back ([`Held`]).
@@ -837,8 +855,10 @@ fn install() {
                 // changes.
                 let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 };
                 if done && old == PAGE_READONLY {
-                    // (holding implies this thread's locals are there)
-                    let _ = OPENED_HELD.try_with(|o| o.borrow_mut().push(block));
+                    let n = OPENED_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if let Some(slot) = OPENED_HELD.get(n) {
+                        slot.store(block + 1, std::sync::atomic::Ordering::Release);
+                    }
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
