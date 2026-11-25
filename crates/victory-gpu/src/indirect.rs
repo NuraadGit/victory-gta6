@@ -86,6 +86,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint dst_at = id.x * stride;
     uint cost = 0;
     uint asked = 0;
+    // Diagnostics: a compute record emptied by the cap on one dispatch's groups.
+    bool capped = false;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
     if (gi == 0) {
@@ -124,6 +126,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
+            capped = true;
         }
         // Split (bit 2): the groups past 65,535 in x, up to 65,535 more, run
         // as a second record (below), charged with the first.
@@ -131,6 +134,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (rest != 0 && g.y * g.z != 0 && g.x + rest > GROUPS / (g.y * g.z)) {
             g = uint3(0, 0, 0);
             rest = 0;
+            capped = true;
         }
         cost = (g.x + rest) * g.y * g.z * 64u;
         groups = g;
@@ -205,6 +209,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         return;
     }
     bool over = fits[gi] == 0;
+    // Diagnostics (budget words 3 and 4): compute records the list's budget
+    // emptied, and those the group cap emptied.
+    if (kind == 2) {
+        uint was;
+        if (over && costs[gi] > 0) {
+            budget.InterlockedAdd(12, 1, was);
+        }
+        if (capped) {
+            budget.InterlockedAdd(16, 1, was);
+        }
+    }
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
