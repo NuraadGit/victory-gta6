@@ -482,6 +482,28 @@ fn private_remove(at: usize, len: usize) -> bool {
 /// `Some(true)` if the entire range is private title memory; `Some(false)`
 /// if it starts there but extends outside it; `None` otherwise. In particular,
 /// a known first guard must not authorize protecting adjacent host memory.
+/// Whether all of block `block` is title memory we may make read-only: a
+/// view (a mapped section) or registered private title memory. Takes the
+/// registry's lock under the guards' (nothing takes them the other way).
+fn guardable(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (start, end) = (block * BLOCK, (block + 1) * BLOCK);
+    let mut at = start;
+    let mut mapped = true;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 || info.Type != MEM_MAPPED {
+            mapped = false;
+            break;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+    mapped || private_range(start, end) == Some(true)
+}
+
 fn private_range(start: usize, end: usize) -> Option<bool> {
     let ranges = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
     ranges
@@ -732,6 +754,13 @@ fn is_view(start: usize, end: usize) -> bool {
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
+        // Title memory only, block by block: a range that begins in a view
+        // runs on into whatever follows it, and the process heap made
+        // read-only faulted inside the heap's own lock (an allocation in the
+        // driver) while a copy held the guards and waited for that lock.
+        if !(from..to).all(guardable) {
+            return false;
+        }
         let mut old = 0;
         // SAFETY: title view or registered private memory; only its protection changes.
         unsafe {
@@ -1202,6 +1231,8 @@ mod tests {
         let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
         assert!(!p.is_null());
         let block = p as usize / BLOCK;
+        // Title memory (only that is guarded).
+        title_memory_private(p as usize, 2 * BLOCK);
         {
             let mut g = guards();
             protect(&mut g, block, block + 1);
@@ -1214,6 +1245,23 @@ mod tests {
         assert!(writable(block * BLOCK));
         // SAFETY: written above.
         assert_eq!(unsafe { std::ptr::read_volatile((block * BLOCK + 8) as *const u8) }, 7);
+        // SAFETY: the allocation above.
+        unsafe { VirtualFree(p, 0, MEM_RELEASE) };
+        title_memory_private_gone(p as usize, 2 * BLOCK);
+    }
+
+    #[test]
+    fn memory_that_is_no_title_memory_is_never_made_read_only() {
+        // The process heap beside a view: guarding it faulted inside the
+        // heap's own lock while a copy held the guards and waited for it.
+        // SAFETY: a fresh allocation of 2 blocks, freed below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        let block = p as usize / BLOCK;
+        assert!(!guardable(block));
+        protect(&mut guards(), block, block + 2);
+        assert!(!guards().protected.contains(&block));
+        assert!(writable(block * BLOCK));
         // SAFETY: the allocation above.
         unsafe { VirtualFree(p, 0, MEM_RELEASE) };
     }
