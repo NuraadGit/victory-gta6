@@ -2116,7 +2116,11 @@ impl State {
         if crate::pipeline::is_tracer(self.pipeline as This) && !crate::pipeline::tracer_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_why("a ray-traced pass, held back while the structure builder does not run".to_owned());
+            crate::pipeline::note_why(format!(
+                "a ray-traced pass, held back while the structure builder does not run: {}",
+                crate::pipeline::host_pipeline_for(self.pipeline as This, &self.formats)
+                    .map_or_else(|| "?".to_owned(), |p| p.name.clone())
+            ));
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.formats) else {

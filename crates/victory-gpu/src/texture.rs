@@ -975,9 +975,51 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        #[cfg(feature = "diagnostics")]
+        self.trace_tiny(read);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+    }
+
+    /// `VICTORY_TRACE_TINY_TEX=<bytes>` (diagnostics builds): logs the
+    /// refreshes of textures of at most that many bytes (address, size,
+    /// first 16 bytes): the first 20 of each texture, then every 200th.
+    /// To see whether a small state texture the title reads (exposure)
+    /// follows what its shaders write to the same memory.
+    #[cfg(feature = "diagnostics")]
+    fn trace_tiny(&self, read: usize) {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static LIMIT: OnceLock<usize> = OnceLock::new();
+        static SEEN: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+        let limit = *LIMIT.get_or_init(|| {
+            std::env::var("VICTORY_TRACE_TINY_TEX").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
+        let size = self.layout.size as usize;
+        if read == 0 || limit == 0 || size > limit {
+            return;
+        }
+        let n = {
+            let mut seen = SEEN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+            let n = seen.entry(self.memory as usize).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if n > 20 && n % 200 != 0 {
+            return;
+        }
+        let mut bytes = [0u8; 16];
+        let shown = crate::host::read_into(self.memory as *const u8, &mut bytes[..size.min(16)]);
+        let words: Vec<f32> = bytes.chunks_exact(4).map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        tracing::info!(
+            at = format_args!("{:#x}", self.memory as usize),
+            size,
+            n,
+            frame = crate::frame::current(),
+            "tiny texture refreshed from title memory: {:?}",
+            if shown { words } else { vec![] }
+        );
     }
 
     /// Returns the bytes of title memory read.
