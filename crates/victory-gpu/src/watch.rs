@@ -440,7 +440,9 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 
 fn guards() -> Held {
     let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-    HOLDING.set(true);
+    // (`try_with`: a thread on its way out, its locals gone, still faults
+    // into the handler, which takes the guards)
+    let _ = HOLDING.try_with(|h| h.set(true));
     Held(g)
 }
 
@@ -473,12 +475,12 @@ impl std::ops::DerefMut for Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let opened = OPENED_HELD.with(|o| std::mem::take(&mut *o.borrow_mut()));
+        let opened = OPENED_HELD.try_with(|o| std::mem::take(&mut *o.borrow_mut())).unwrap_or_default();
         for block in opened {
             self.0.protected.remove(&block);
             self.0.clean.remove(&block);
         }
-        HOLDING.set(false);
+        let _ = HOLDING.try_with(|h| h.set(false));
     }
 }
 
@@ -822,7 +824,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        if HOLDING.get() {
+        if HOLDING.try_with(|h| h.get()).unwrap_or(false) {
             // This thread holds the guards (a fault inside a copy's own
             // work): a block it made read-only is opened here, without the
             // lock, and noted when the lock is given back ([`Held`]).
@@ -835,7 +837,8 @@ fn install() {
                 // changes.
                 let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 };
                 if done && old == PAGE_READONLY {
-                    OPENED_HELD.with(|o| o.borrow_mut().push(block));
+                    // (holding implies this thread's locals are there)
+                    let _ = OPENED_HELD.try_with(|o| o.borrow_mut().push(block));
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
