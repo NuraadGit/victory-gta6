@@ -603,12 +603,6 @@ fn is_view(start: usize, end: usize) -> bool {
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
-        // Views only: a range that runs past a view's end into the
-        // process's heap made the heap read-only, and an allocation then
-        // faulted inside a copy holding the guards.
-        if !all_views(from, to) {
-            return false;
-        }
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
         unsafe {
@@ -836,8 +830,9 @@ fn install() {
             let block = at / BLOCK;
             if read_only(at) {
                 let mut old = 0;
-                // SAFETY: a block we made read-only (read-only memory in a
-                // view: only ours is); only its protection changes.
+                // SAFETY: a block we made read-only (read-only data memory
+                // in a block this thread is guarding); only its protection
+                // changes.
                 let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 };
                 if done && old == PAGE_READONLY {
                     OPENED_HELD.with(|o| o.borrow_mut().push(block));
@@ -868,35 +863,17 @@ fn install() {
     });
 }
 
-/// Whether `at` is committed read-only memory of a view (memory we guard).
+/// Whether `at` is committed read-only data memory (what we guard: views,
+/// and private memory beside them; never an image's code or constants).
 fn read_only(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
+        MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READONLY
-}
-
-/// Whether all of blocks `[from, to)` is view memory (mapped sections): the
-/// title's views are, the process's own heap and allocations are not, and
-/// must never be made read-only.
-fn all_views(from: usize, to: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let (mut at, end) = (from * BLOCK, to * BLOCK);
-    while at < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.Type != MEM_MAPPED || info.RegionSize == 0 {
-            return false;
-        }
-        at = info.BaseAddress as usize + info.RegionSize;
-    }
-    true
+    n != 0 && info.State == MEM_COMMIT && info.Type != MEM_IMAGE && info.Protect == PAGE_READONLY
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -920,19 +897,28 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     #[test]
-    fn private_memory_is_never_made_read_only() {
-        // Process memory (a heap's, an allocation's) next to the title's
-        // views: guarding it made allocations fault inside a copy that held
-        // the guards, and every thread waited for good.
-        // SAFETY: a fresh private allocation of 4 blocks, freed below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    fn a_write_fault_while_the_guards_are_held_does_not_wait_for_them() {
+        // A copy holding the guards allocated, the allocation wrote a
+        // guarded block, and the handler waited for the guards this thread
+        // held: every thread stopped behind it. The handler now opens such
+        // a block on its own, and the guards note it when given back.
+        install();
+        // SAFETY: a fresh allocation of 2 blocks (64 KiB aligned), freed below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
         assert!(!p.is_null());
-        let (from, to) = ((p as usize).div_ceil(BLOCK), (p as usize + 4 * BLOCK) / BLOCK);
-        assert!(from < to);
-        assert!(!all_views(from, to));
-        protect(&mut guards(), from, to);
-        assert!(!guards().protected.contains(&from));
-        assert!(writable(from * BLOCK), "private memory left writable");
+        let block = p as usize / BLOCK;
+        {
+            let mut g = guards();
+            protect(&mut g, block, block + 1);
+            assert!(g.protected.contains(&block));
+            // SAFETY: inside the allocation; a guarded (read-only) block.
+            unsafe { std::ptr::write_volatile((block * BLOCK + 8) as *mut u8, 7) };
+            assert!(g.protected.contains(&block), "settled only when given back");
+        }
+        assert!(!guards().protected.contains(&block));
+        assert!(writable(block * BLOCK));
+        // SAFETY: written above.
+        assert_eq!(unsafe { std::ptr::read_volatile((block * BLOCK + 8) as *const u8) }, 7);
         // SAFETY: the allocation above.
         unsafe { VirtualFree(p, 0, MEM_RELEASE) };
     }
