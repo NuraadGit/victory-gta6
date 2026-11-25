@@ -73,7 +73,26 @@ impl Default for Selection {
     }
 }
 
+/// Whether what the selection stands at is to be shown (and kept): nothing
+/// was chosen before, the chosen buffer is there, or a key asked for another.
+fn choice_holds(chosen: bool, found: bool, keyed: bool) -> bool {
+    !chosen || found || keyed
+}
+
+/// `VICTORY_PIP_FORMAT=<DXGI format number>`: the view starts at the frame's
+/// first full-size target of that format (27: the colour buffer).
+fn first_format() -> Option<i32> {
+    static FORMAT: OnceLock<Option<i32>> = OnceLock::new();
+    *FORMAT.get_or_init(|| std::env::var("VICTORY_PIP_FORMAT").ok().and_then(|v| v.parse().ok()))
+}
+
 impl Selection {
+    /// Whether the keys held now ask for the previous or the next target
+    /// (asked before [`Selection::update`], which remembers them).
+    fn steps(&self, down: [bool; 3]) -> bool {
+        (down[1] && !self.down[1]) != (down[2] && !self.down[2])
+    }
+
     // Key order: toggle, previous, next. The high key-state bit is used;
     // the process-global "pressed since last query" bit is deliberately ignored.
     fn update(&mut self, count: usize, down: [bool; 3]) -> Option<usize> {
@@ -185,11 +204,23 @@ pub(crate) fn begin_present() -> Option<Target> {
     let found = t
         .chosen
         .and_then(|r| full.iter().position(|x| x.resource == r))
-        .or_else(|| t.chosen_shape.and_then(|s| full.iter().position(|x| shape(x) == s)));
+        .or_else(|| t.chosen_shape.and_then(|s| full.iter().position(|x| shape(x) == s)))
+        // Nothing chosen yet: the first of the format asked for, if any.
+        .or_else(|| {
+            let wanted = if t.chosen.is_none() { first_format() } else { None };
+            wanted.and_then(|f| full.iter().position(|x| shape(x).2 == f))
+        });
     if let Some(at) = found {
         t.selection.index = at;
     }
+    let keyed = t.selection.steps(down);
     let selected = t.selection.update(count, down).map(|i| (i, full[i].clone()));
+    // A frame without the chosen buffer (a scene change, a menu, a frame
+    // that only decodes a video) shows nothing and keeps the choice; only
+    // the keys, or the first frame, choose another.
+    let selected = selected.filter(|_| choice_holds(t.chosen.is_some(), found.is_some(), keyed));
+    // With a format asked for, nothing else becomes the first choice.
+    let selected = selected.filter(|_| t.chosen.is_some() || found.is_some() || keyed || first_format().is_none());
     if let Some((_, target)) = &selected {
         t.chosen = Some(target.resource);
         t.chosen_shape = Some(shape(target));
@@ -669,6 +700,20 @@ impl Pass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_without_the_chosen_target_keeps_the_choice() {
+        // (chosen before, found in this frame, a key pressed)
+        assert!(choice_holds(false, false, false), "nothing chosen yet: the first is");
+        assert!(choice_holds(true, true, false));
+        assert!(!choice_holds(true, false, false), "a video frame does not take the choice");
+        assert!(choice_holds(true, false, true), "the keys do");
+        let mut s = Selection::default();
+        assert!(s.steps([false, false, true]));
+        s.update(4, [false, false, true]);
+        assert!(!s.steps([false, false, true]), "held: one step");
+        assert!(!s.steps([true, false, false]), "the toggle is no step");
+    }
 
     #[test]
     fn selection_edges_wrap_toggle_and_resize() {
