@@ -3342,6 +3342,13 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
+    /// Whether any instruction or phi reads `v`.
+    fn read_anywhere(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v)) || b.phis.iter().any(|p| p.args.contains(&v))
+        })
+    }
+
     /// Whether some instruction computes with `v` (scalar or vector
     /// arithmetic), rather than only naming it in a descriptor operand,
     /// moving it (at most `depth` moves are followed) or comparing it: a
@@ -6653,8 +6660,23 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
+        // A buffer descriptor nothing uses as one, read only for its record
+        // count (dword 2): a pass that does nothing for an empty buffer tests
+        // it first (the depth pyramid `ceb5eb68`, `s_cmp_eq_u32` on it). The
+        // used-resource list says it is a buffer; its view's size gives the
+        // count. (The address-only path below would leave the count unknown.)
+        let read = |k: u8| inst.write(Reg::S(code + k)).is_some_and(|v| self.read_anywhere(v));
+        let count_only = use_at.is_none()
+            && count >= 3
+            && read(2)
+            && !read(0)
+            && !read(1)
+            && self
+                .used_kind(&Source::Loaded { load: site, first: 0 })
+                .is_some_and(|u| u.dwords == 4 && matches!(u.kind, ResourceType::Srv | ResourceType::Uav));
         let (at, first) = match use_at {
             Some((at, first)) => (Some(at), first),
+            None if count_only => (None, 0),
             None => {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
@@ -6747,6 +6769,7 @@ impl<'a> Lower<'a> {
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match ui.map(|i| &i.fields) {
+            None if count_only => ((11 | u, 0), None),
             None => ((2, 0x409), Some(2)),
             // A ray-tracing structure in a buffer of the host: read raw.
             Some(Fields::Image { .. }) if un.starts_with("image_bvh") => ((11, 0), None),
