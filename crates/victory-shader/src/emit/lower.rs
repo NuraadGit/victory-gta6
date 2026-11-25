@@ -348,6 +348,11 @@ impl Vals {
         self.maps[at].insert(v, x);
     }
 
+    fn remove(&mut self, v: &Value) {
+        let at = self.slot(v);
+        self.maps[at].remove(v);
+    }
+
     fn entry(&mut self, v: Value) -> std::collections::hash_map::Entry<'_, Value, Val> {
         let at = self.slot(&v);
         self.maps[at].entry(v)
