@@ -10,7 +10,7 @@
 use std::ffi::{CStr, c_void};
 
 #[cfg(windows)]
-use super::xmem::VirtualFree;
+use super::xmem::{VirtualAlloc, VirtualFree};
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
@@ -368,6 +368,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             #[cfg(windows)]
             hle_export!(VirtualFree),
+            #[cfg(windows)]
+            hle_export!(VirtualAlloc),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),

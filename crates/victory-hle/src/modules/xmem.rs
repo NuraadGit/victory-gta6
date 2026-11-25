@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree as host_virtual_free,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc as host_virtual_alloc, VirtualAlloc2, VirtualFree as host_virtual_free,
     VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
@@ -198,6 +198,27 @@ fn register_private(at: *mut c_void, len: usize) -> bool {
     let len = len.saturating_add(KERNEL_PAGE - 1) / KERNEL_PAGE * KERNEL_PAGE;
     victory_gpu::title_memory_private(at as usize, len);
     true
+}
+
+/// The title's own `VirtualAlloc` (its allocators call it directly, not
+/// through XMem): forwarded unchanged, and committed private memory without
+/// write watching registered with the GPU side like XMem's, so the copies
+/// of it are guarded instead of copied whole every time (2.9 GB a frame
+/// with the ray-tracing builder on). What reaches us through the title's
+/// imports is the title's memory; the host's own allocations never do.
+pub extern "system" fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    // SAFETY: the title's own arguments, unchanged.
+    let at = unsafe { host_virtual_alloc(address, size, kind, protect) };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        // Registration queries must not change the error the title sees.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        // A commit inside an older reservation starts at `address` rounded
+        // down to its page, which is what came back.
+        let end = (address as usize).max(at as usize).saturating_add(size);
+        register_private(at, end - at as usize);
+        unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    }
+    at
 }
 
 /// Title frees otherwise pass straight to Windows. Forget private ownership
@@ -876,7 +897,7 @@ fn commit(base: usize, len: usize) -> bool {
         return true; // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    if !unsafe { host_virtual_alloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
     let error = std::io::Error::last_os_error();
@@ -1103,10 +1124,22 @@ mod tests {
     }
 
     #[test]
+    fn the_titles_own_virtual_alloc_registers_its_private_memory() {
+        // Committed private memory without write watching, as the title's
+        // allocators get it from VirtualAlloc directly.
+        let p = VirtualAlloc(std::ptr::null_mut(), 3 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        assert!(!p.is_null());
+        assert!(victory_gpu::title_memory_private_gone(p as usize, 3 * 4096), "registered");
+        assert!(register_private(p, 3 * 4096));
+        assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+        assert!(!victory_gpu::title_memory_private_gone(p as usize, 3 * 4096), "gone with the free");
+    }
+
+    #[test]
     fn chosen_base_private_commits_and_placeholder_replacements_are_registered() {
         // A title-chosen reservation without MEM_WRITE_WATCH.
         // SAFETY: a new reservation, released below.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        let p = unsafe { host_virtual_alloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!p.is_null());
         assert_eq!(
             XMemVirtualAlloc(p, 2 * PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
