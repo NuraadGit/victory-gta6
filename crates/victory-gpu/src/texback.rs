@@ -83,14 +83,31 @@ fn parse(value: Option<&str>) -> Mode {
     }
 }
 
+/// Of the nine kinds the water programs write, the two copied back by
+/// default: 64x64 R32G32_FLOAT and 128x128 R16G16_UINT (DXGI formats 16 and
+/// 36; the list iGoldenNinja found on fork PR #999). With all nine landed
+/// (the 256x256 and 512x512 height and displacement maps, the 2048x128 and
+/// 4096x64 R8/R16 integer textures) the title's script read through a null
+/// object ~13 s after "Follow the plane" began, or the card hung, 6 runs of
+/// 6 on the Jason save; with these two the mission went on to "Collect the
+/// package", the boat afloat (run k1, 572 s).
+const KINDS: [(u64, u32, u32); 2] = [(64, 64, 16), (128, 128, 36)];
+
 /// `VICTORY_TEXTURE_BACK_KINDS=<width>x<height>f<format>[,...]` with
-/// `VICTORY_TEXTURE_BACK=1`: of what the water programs write, only these.
+/// `VICTORY_TEXTURE_BACK=1`: of what the water programs write, only these
+/// (default [`KINDS`]; `all`: every kind they write).
 fn kinds_filter() -> Option<&'static [(u64, u32, u32)]> {
-    static KINDS: OnceLock<Option<Vec<(u64, u32, u32)>>> = OnceLock::new();
-    KINDS
-        .get_or_init(|| match parse(std::env::var("VICTORY_TEXTURE_BACK_KINDS").ok().as_deref()) {
-            Mode::Kinds(k) => Some(k),
-            _ => None,
+    static FILTER: OnceLock<Option<Vec<(u64, u32, u32)>>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let v = std::env::var("VICTORY_TEXTURE_BACK_KINDS").ok();
+            if v.as_deref().map(str::trim) == Some("all") {
+                return None;
+            }
+            match parse(v.as_deref()) {
+                Mode::Kinds(k) => Some(k),
+                _ => Some(KINDS.to_vec()),
+            }
         })
         .as_deref()
 }
