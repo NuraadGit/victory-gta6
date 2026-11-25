@@ -7,17 +7,21 @@
 //! nothing had written (run rw1, `VICTORY_READ_WATCH=1`: about 30 places in
 //! the title read those two kinds), and boats sank.
 //!
-//! For textures of the kinds in `VICTORY_TEXTURE_BACK` (comma-separated
-//! `<width>x<height>f<format>`; `1` for the four water formats found by
-//! the upstream trace), a list in which shaders write one copies it
-//! into a read-back buffer of ours when it closes, and once the list has run
-//! the texels are tiled into the texture's title memory in the console's
-//! layout, as the console's GPU would have left them.
+//! With `VICTORY_TEXTURE_BACK=1`, a list in which one of the title's water
+//! programs ([`WRITERS`], by shader hash: the traces in fork issue #863)
+//! writes a texture copies it into a read-back buffer of ours when it
+//! closes, and once the list has run the texels are tiled into the texture's
+//! title memory in the console's layout, as the console's GPU would have
+//! left them. By the writing program, not by the texture's shape: other
+//! textures of the same sizes and formats are placed in memory the title
+//! uses again within the frame, and writing those back puts texels over
+//! whatever lies there by then.
 //!
-//! shortcut: by kind, not by texture: textures of those kinds the title never
-//! reads are copied back too (about a megabyte per such list). The copy shows
-//! what the list's last write left; a title read in between sees the frame
-//! before, as it would before the console's GPU has run.
+//! `VICTORY_TEXTURE_BACK=<width>x<height>f<format>[,...]`: by kind instead,
+//! whatever program writes them, as the patch did at first.
+//!
+//! The copy shows what the list's last write left; a title read in between
+//! sees the frame before, as it would before the console's GPU has run.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -26,36 +30,91 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
-/// The kinds copied back: (width, height, format).
-fn kinds() -> &'static [(u64, u32, u32)] {
-    static KINDS: OnceLock<Vec<(u64, u32, u32)>> = OnceLock::new();
-    KINDS.get_or_init(|| {
-        const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        let list = match std::env::var("VICTORY_TEXTURE_BACK").as_deref() {
-            Ok("1") => DEFAULT.to_owned(),
-            Ok(spec) => spec.to_owned(),
-            Err(_) => String::new(),
-        };
-        let kinds: Vec<(u64, u32, u32)> = list
-            .split(',')
-            .filter_map(|k| {
-                let (size, format) = k.trim().split_once('f')?;
-                let (w, h) = size.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
-            })
-            .collect();
-        if !kinds.is_empty() {
-            tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)");
+/// What is copied back.
+enum Mode {
+    Off,
+    /// What the programs of [`WRITERS`] write.
+    Programs,
+    /// Textures of these kinds (width, height, format), whoever writes them.
+    Kinds(Vec<(u64, u32, u32)>),
+}
+
+/// The compute programs whose output textures the title's CPU code reads:
+/// `WaterSimMgr:CS_CompositeSimDataIntoOutputTexture*` (height and
+/// displacement) and `water_compressed_simulation_rendertarget:CS_MinMax_*`
+/// (the simulation's heights in blocks).
+const WRITERS: [&str; 13] = [
+    "ba423f650a4e8c2f",
+    "5d3fa5f1ee755e44",
+    "bf0e8d5ee5ae755c",
+    "e4609cfad2176dac",
+    "8e9fa5ede09d77c5",
+    "f64bac83df2ea939",
+    "6c4c4ff7283f90b3",
+    "3ffb92133d372b30",
+    "bdf438d5731d36cc",
+    "253532a6de53babc",
+    "a2f1004f8d6d7aad",
+    "65b6e65c9994d495",
+    "9809b8d965b04935",
+];
+
+fn parse(value: Option<&str>) -> Mode {
+    match value.map(str::trim) {
+        None | Some("" | "0") => Mode::Off,
+        Some("1") => Mode::Programs,
+        Some(spec) => {
+            let kinds: Vec<(u64, u32, u32)> = spec
+                .split(',')
+                .filter_map(|k| {
+                    let (size, format) = k.trim().split_once('f')?;
+                    let (w, h) = size.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+                })
+                .collect();
+            if kinds.is_empty() { Mode::Off } else { Mode::Kinds(kinds) }
         }
-        kinds
+    }
+}
+
+fn mode() -> &'static Mode {
+    static MODE: OnceLock<Mode> = OnceLock::new();
+    MODE.get_or_init(|| {
+        let mode = parse(std::env::var("VICTORY_TEXTURE_BACK").ok().as_deref());
+        match &mode {
+            Mode::Off => {}
+            Mode::Programs => tracing::info!("the textures the title's water programs write are copied back into title memory (VICTORY_TEXTURE_BACK=1)"),
+            Mode::Kinds(kinds) => tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)"),
+        }
+        mode
     })
 }
 
-/// Whether title texture `resource` is of a kind copied back.
+thread_local! {
+    /// Whether the dispatch this thread prepares is of a program of [`WRITERS`].
+    static WRITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn writer(hash: &str) -> bool {
+    WRITERS.iter().any(|w| w.eq_ignore_ascii_case(hash))
+}
+
+/// Before (and, with `None`, after) a shader's views are prepared: the
+/// compute shader's hash.
+pub(crate) fn preparing(hash: Option<&str>) {
+    if matches!(mode(), Mode::Programs) {
+        WRITING.set(hash.is_some_and(writer));
+    }
+}
+
+/// Whether title texture `resource`, about to be written through unordered
+/// access, is copied back.
 pub(crate) fn wanted(resource: This) -> bool {
-    let kinds = kinds();
-    !kinds.is_empty()
-        && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    match mode() {
+        Mode::Off => false,
+        Mode::Programs => WRITING.get() && crate::resource::texture_kind(resource).is_some(),
+        Mode::Kinds(kinds) => crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k)),
+    }
 }
 
 /// An outstanding write to a specific allocation. Mapping and resource
@@ -253,6 +312,17 @@ pub(crate) fn land(back: &Back) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_water_programs_textures_are_copied_back_by_default() {
+        assert!(matches!(parse(None), Mode::Off) && matches!(parse(Some("0")), Mode::Off) && matches!(parse(Some(" ")), Mode::Off));
+        assert!(matches!(parse(Some("1")), Mode::Programs));
+        assert!(matches!(parse(Some("256x256f41, 64x64f16")), Mode::Kinds(k) if k == [(256, 256, 41), (64, 64, 16)]));
+        assert!(matches!(parse(Some("nonsense")), Mode::Off));
+        assert!(writer("bdf438d5731d36cc") && writer("BDF438D5731D36CC"));
+        assert!(!writer("907ba309e720e216") && !writer(""));
+        assert!(WRITERS.iter().all(|w| w.len() == 16), "whole hashes");
+    }
 
     #[test]
     fn only_readbacks_for_changed_allocations_are_invalidated() {

@@ -1131,7 +1131,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            crate::texback::preparing(compute.then_some(stage.shader.hash.as_str()));
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            crate::texback::preparing(None);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
