@@ -4683,9 +4683,9 @@ impl<'a> Lower<'a> {
     /// exchange theirs, which needs every lane there.
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
-        // Local waves use this host wave's answer, just as their reductions do.
-        // Approximate: SCC may differ between the two halves of a console wave.
+        // (not for a console wave cut into host waves that do not exchange)
         if !self.console_lanes
+            || self.local
             || self.exchange.is_none() && self.halves.is_some() && self.paired.is_none()
         {
             return Err(LANE_MASK);
@@ -4703,7 +4703,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
