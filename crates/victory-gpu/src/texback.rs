@@ -88,9 +88,9 @@ fn parse(value: Option<&str>) -> Mode {
 /// 36; the list iGoldenNinja found on fork PR #999). With all nine landed
 /// (the 256x256 and 512x512 height and displacement maps, the 2048x128 and
 /// 4096x64 R8/R16 integer textures) the title's script read through a null
-/// object ~13 s after "Follow the plane" began, or the card hung, 6 runs of
-/// 6 on the Jason save; with these two the mission went on to "Collect the
-/// package", the boat afloat (run k1, 572 s).
+/// object about 13 s after the boat mission handed over control, or the card
+/// hung, in 6 runs of 6 from a checkpoint there; with these two the mission
+/// went on to its next objective with the boat afloat (one 572 s run).
 const KINDS: [(u64, u32, u32); 2] = [(64, 64, 16), (128, 128, 36)];
 
 /// `VICTORY_TEXTURE_BACK_KINDS=<width>x<height>f<format>[,...]` with

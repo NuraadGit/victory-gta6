@@ -1,7 +1,9 @@
 //! Mesh draws launched by the card: an amplification shader of ours
 //! (`launch.hlsl`, embedded as `launch.dxil`) in front of every translated
-//! mesh shader (`VICTORY_MESH_LAUNCH`, on by default; `0`: the clamp of
-//! `crate::indirect` before each record, as before).
+//! mesh shader (`VICTORY_MESH_LAUNCH=1`; off by default here: on an RTX
+//! 2080 a draw launched this way was the last the card started before a
+//! device hang, twice in one scene, so it stays opt-in until that is
+//! understood. Off: the clamp of `crate::indirect` before each record).
 //!
 //! The title draws its meshes one indirect record a call, each from the
 //! next slot of an argument buffer its own compute passes wrote: 1,600
@@ -58,10 +60,10 @@ pub(crate) const DIRECT_NONE: u32 = u32::MAX;
 const SPACE: u32 = victory_shader::emit::LAUNCH_SPACE;
 
 /// Whether mesh pipelines get the amplification stage and indirect mesh
-/// records are launched by it (`VICTORY_MESH_LAUNCH=0`: not).
+/// records are launched by it (`VICTORY_MESH_LAUNCH=1`; off by default).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LAUNCH").is_some_and(|v| v == "1"))
 }
 
 /// The amplification stage's code.
@@ -154,7 +156,7 @@ pub(crate) fn line(frames: f64) {
     if records + direct > 0 {
         tracing::info!(
             "mesh draws launched by the card per frame: {:.0} records read where the title wrote them, {:.0} counts \
-             known on the CPU (no pass of ours between them; VICTORY_MESH_LAUNCH=0: each record clamped by one)",
+             known on the CPU (no pass of ours between them; without VICTORY_MESH_LAUNCH=1: each record clamped by one)",
             records as f64 / frames,
             direct as f64 / frames
         );
