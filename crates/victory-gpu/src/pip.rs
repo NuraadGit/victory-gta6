@@ -106,6 +106,9 @@ struct Tracking {
     frames: Frames<Target>,
     selection: Selection,
     logged: Option<(usize, usize, usize, u64, u32, i32)>,
+    /// The resource last shown: kept across frames by identity, not index
+    /// (a frame writes some 300 targets, in an order that shifts).
+    chosen: Option<usize>,
 }
 
 fn tracking() -> &'static Mutex<Tracking> {
@@ -140,11 +143,29 @@ pub(crate) fn begin_present() -> Option<Target> {
     // SAFETY: plain key-state queries, exactly once per key per present.
     let down = unsafe { [VK_F6, VK_F7, VK_F8].map(|key| GetAsyncKeyState(i32::from(key.0)) < 0) };
     let mut t = tracking().lock().unwrap_or_else(|e| e.into_inner());
-    let count = t.frames.previous.len();
-    let selected = t
-        .selection
-        .update(count, down)
-        .map(|i| (i, t.frames.previous[i].clone()));
+    // Only the frame's full-size targets (at least half the widest one's
+    // width): G-buffer, depth, lighting, post-processing; not the hundreds
+    // of shadow tiles, probes and small intermediates.
+    let full: Vec<Target> = {
+        // SAFETY: the Arcs hold these resources.
+        let widths: Vec<u64> = t.frames.previous.iter().map(|x| unsafe { x.copy.texture.GetDesc() }.Width).collect();
+        let widest = widths.iter().copied().max().unwrap_or(0);
+        t.frames
+            .previous
+            .iter()
+            .zip(widths)
+            .filter(|&(_, w)| w.saturating_mul(2) >= widest)
+            .map(|(x, _)| x.clone())
+            .collect()
+    };
+    let count = full.len();
+    if let Some(at) = t.chosen.and_then(|r| full.iter().position(|x| x.resource == r)) {
+        t.selection.index = at;
+    }
+    let selected = t.selection.update(count, down).map(|i| (i, full[i].clone()));
+    if let Some((_, target)) = &selected {
+        t.chosen = Some(target.resource);
+    }
     if let Some((i, target)) = &selected {
         // SAFETY: the Arc holds this resource.
         let d = unsafe { target.copy.texture.GetDesc() };
