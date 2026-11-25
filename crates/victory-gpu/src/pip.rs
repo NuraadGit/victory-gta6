@@ -148,13 +148,23 @@ pub(crate) fn begin_present() -> Option<Target> {
     // of shadow tiles, probes and small intermediates.
     let full: Vec<Target> = {
         // SAFETY: the Arcs hold these resources.
-        let widths: Vec<u64> = t.frames.previous.iter().map(|x| unsafe { x.copy.texture.GetDesc() }.Width).collect();
-        let widest = widths.iter().copied().max().unwrap_or(0);
+        let sizes: Vec<(u64, u64)> = t
+            .frames
+            .previous
+            .iter()
+            .map(|x| unsafe { x.copy.texture.GetDesc() })
+            .map(|d| (d.Width, u64::from(d.Height)))
+            .collect();
+        // The screen's size: the largest target shaped like a screen (width
+        // 1.2 to 2.4 times its height), so wide atlases (15360x180) do not
+        // set it.
+        let screen = |&(w, h): &(u64, u64)| h > 0 && w * 10 >= h * 12 && w * 10 <= h * 24;
+        let (sw, sh) = sizes.iter().copied().filter(screen).max_by_key(|&(w, h)| w * h).unwrap_or((0, 0));
         t.frames
             .previous
             .iter()
-            .zip(widths)
-            .filter(|&(_, w)| w.saturating_mul(2) >= widest)
+            .zip(sizes)
+            .filter(|&(_, (w, h))| sw > 0 && w.saturating_mul(2) >= sw && h.saturating_mul(2) >= sh)
             .map(|(x, _)| x.clone())
             .collect()
     };
