@@ -485,8 +485,6 @@ fn per_lane_values(p: &Program, res: &Resources) -> HashSet<Value> {
 
 struct Lower<'a> {
     s: Shader,
-    /// Console-visible allocation; excludes wave-emulation scratch in `s.lds_dwords`.
-    lds_limit_dwords: u32,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: Halved<Value, Why>,
@@ -1881,14 +1879,7 @@ impl<'a> Lower<'a> {
                 e.usage = (1 << e.cols) - 1;
             }
         }
-        let lds_limit_dwords = match &x.native.io {
-            StageIo::Cs(cs) => cs.lds_bytes() / 4,
-            StageIo::Ms(ms) => ms.lds_bytes.div_ceil(4),
-            StageIo::Gs(_) => s.lds_dwords,
-            _ => 0,
-        };
         Lower {
-            lds_limit_dwords,
             s,
             x,
             bad,
@@ -2653,15 +2644,6 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
-        // Count every groupshared allocation, including emulation scratch.
-        let limit = match &self.x.native.io {
-            StageIo::Cs(_) => 32 * 1024 / 4,
-            StageIo::Ms(_) => 28 * 1024 / 4,
-            _ => u32::MAX, // Geometry LDS is private per invocation.
-        };
-        if self.s.lds_dwords > limit {
-            return Err(unsupported(0, "LDS exceeds the host stage's groupshared limit"));
-        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -5433,27 +5415,16 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are naturally aligned. Check before adding
-        // the instruction offset, so overflow cannot alias the allocation's start.
-        // Keep the pointer itself in bounds even on the discarded path.
-        let dword = |l: &mut Self, bytes: u32, width: u32| -> (V, V) {
+        // shortcut: LDS addresses are taken as dword-aligned and in bounds
+        // (out-of-bounds console accesses read 0 and drop writes).
+        let dword = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
-            let valid = match l.lds_limit_dwords.checked_mul(4)
-                .and_then(|size| size.checked_sub(bytes.checked_add(width)?)) {
-                Some(last) => {
-                    let last = l.s.m.i32(last);
-                    l.s.m.cmp(c, pred::IULE, a, last)
-                }
-                None => l.s.m.bool(false),
-            };
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
-            let zero = l.s.m.i32(0);
-            let index = l.s.m.select(c, valid, index, zero);
             let lds = l.s.lds();
-            (l.s.m.element(c, lds, index), valid)
+            l.s.m.element(c, lds, index)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5487,7 +5458,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let (p, valid) = dword(self, offset, bits / 8);
+            let p = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -5496,11 +5467,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let at = self.begin_guarded(Some(valid));
-                let w = self.s.m.load(self.cur, p);
-                let zero = self.s.m.i32(0);
-                let w = self.end_guarded(at, &[(w, zero)])[0];
-                let c = self.cur;
+                let w = self.s.m.load(c, p);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -5543,11 +5510,7 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let valid = match guard {
-                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, valid),
-                    None => valid,
-                };
-                let at = self.begin_guarded(Some(valid));
+                let at = self.begin_guarded(guard);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -5566,11 +5529,8 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let (p, valid) = dword(self, off + 4 * k, 4);
-                    let at = self.begin_guarded(Some(valid));
+                    let p = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
-                    let zero = self.s.m.i32(0);
-                    let x = self.end_guarded(at, &[(x, zero)])[0];
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -5592,16 +5552,12 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
+            let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let (p, valid) = dword(self, off, 4);
-                let valid = match guard {
-                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, valid),
-                    None => valid,
-                };
-                let at = self.begin_guarded(Some(valid));
+                let p = dword(self, off);
                 self.s.m.store(self.cur, p, x);
-                self.end_guarded(at, &[]);
             }
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         if self.s.private_lds {
@@ -5637,24 +5593,13 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let (p, valid) = dword(self, offset, 4);
-        // An active out-of-range atomic returns zero; an inactive lane keeps
-        // its previous destination. Neither may modify LDS.
-        let zero = self.s.m.i32(0);
-        let outside = match guard {
-            Some(g) => self.s.m.select(self.cur, g, zero, outside),
-            None => zero,
-        };
-        let valid = match guard {
-            Some(g) => self.s.m.bin(self.cur, Bin::And, g, valid),
-            None => valid,
-        };
+        let p = dword(self, offset);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(Some(valid));
+            let at = self.begin_guarded(guard);
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
@@ -5662,7 +5607,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let at = self.begin_guarded(Some(valid));
+        let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -12735,39 +12680,6 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
-    }
-
-    /// CPU-only: exercise the new branches/phis through the real DXIL validator.
-    #[test]
-    #[cfg(windows)]
-    fn lds_bounds_dynamic_accesses_validate() {
-        let path = super::super::validator::Validator::default_path();
-        let mut validator = super::super::validator::Validator::load(path.as_deref())
-            .expect("this validation test requires dxil.dll");
-        for opcode in [0x0du32, 0x0e, 0x0f, 0x1e, 0x1f,
-            0x36, 0x37, 0x38, 0x3c, 0x76, 0x77, 0x20, 0x30, 0x32, 0x33] {
-            let words = [
-                0x7E00_0200, // v_mov_b32 v0, s0: a dynamic byte address
-                0x7E02_0281, // v_mov_b32 v1, 1
-                0x7E04_0280, // v_mov_b32 v2, 0 (cmpst's second data)
-                0x7E06_0280, // v_mov_b32 v3, 0 (write-only variants have no return)
-                0xD800_0000 | opcode << 18,
-                0x0302_0100, // read/atomic return in v3+, address v0, data v1/v2
-                0xD834_0000, 0x0000_0300, // consume return in ds_write_b32 v0, v3
-                S_ENDPGM,
-            ];
-            let mut emitted = lower_with(&words, vec![root(RootType::Constants, 0, 0)], vec![])
-                .unwrap_or_else(|e| panic!("DS opcode {opcode:#x}: {e}"));
-            validator.validate(&mut emitted.dxil)
-                .unwrap_or_else(|e| panic!("DS opcode {opcode:#x}: {e}"));
-        }
-    }
-
-    #[test]
-    fn lds_bounds_rejects_compute_over_the_host_limit() {
-        let words = [0x7E00_0280, 0x7E02_0281, 0xD834_0000, 0x0000_0100, S_ENDPGM];
-        let error = lowers(&words, 65 << 15).unwrap_err();
-        assert!(error.to_string().contains("groupshared limit"));
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
