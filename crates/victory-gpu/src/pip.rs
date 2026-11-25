@@ -109,6 +109,7 @@ struct Tracking {
     /// The resource last shown: kept across frames by identity, not index
     /// (a frame writes some 300 targets, in an order that shifts).
     chosen: Option<usize>,
+    chosen_shape: Option<(u64, u32, i32)>,
 }
 
 fn tracking() -> &'static Mutex<Tracking> {
@@ -148,12 +149,16 @@ pub(crate) fn begin_present() -> Option<Target> {
     // of shadow tiles, probes and small intermediates.
     let full: Vec<Target> = {
         // SAFETY: the Arcs hold these resources.
-        let sizes: Vec<(u64, u64)> = t
-            .frames
-            .previous
+        let descs: Vec<D3D12_RESOURCE_DESC> =
+            t.frames.previous.iter().map(|x| unsafe { x.copy.texture.GetDesc() }).collect();
+        let sizes: Vec<(u64, u64)> = descs.iter().map(|d| (d.Width, u64::from(d.Height))).collect();
+        // Only what the pass can show (integer formats draw nothing).
+        let viewable: Vec<bool> = descs
             .iter()
-            .map(|x| unsafe { x.copy.texture.GetDesc() })
-            .map(|d| (d.Width, u64::from(d.Height)))
+            .map(|d| {
+                let depth = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
+                colour_view(d.Format, depth).is_some()
+            })
             .collect();
         // The screen's size: the largest target shaped like a screen (width
         // 1.2 to 2.4 times its height), so wide atlases (15360x180) do not
@@ -164,17 +169,30 @@ pub(crate) fn begin_present() -> Option<Target> {
             .previous
             .iter()
             .zip(sizes)
-            .filter(|&(_, (w, h))| sw > 0 && w.saturating_mul(2) >= sw && h.saturating_mul(2) >= sh)
-            .map(|(x, _)| x.clone())
+            .zip(viewable)
+            .filter(|&((_, (w, h)), ok)| ok && sw > 0 && w.saturating_mul(2) >= sw && h.saturating_mul(2) >= sh)
+            .map(|((x, _), _)| x.clone())
             .collect()
     };
     let count = full.len();
-    if let Some(at) = t.chosen.and_then(|r| full.iter().position(|x| x.resource == r)) {
+    // The chosen resource again; else one of its format and size (its
+    // ping-pong twin, or the same kind of buffer in another pass's frame).
+    let shape = |x: &Target| {
+        // SAFETY: the Arc holds this resource.
+        let d = unsafe { x.copy.texture.GetDesc() };
+        (d.Width, d.Height, d.Format.0)
+    };
+    let found = t
+        .chosen
+        .and_then(|r| full.iter().position(|x| x.resource == r))
+        .or_else(|| t.chosen_shape.and_then(|s| full.iter().position(|x| shape(x) == s)));
+    if let Some(at) = found {
         t.selection.index = at;
     }
     let selected = t.selection.update(count, down).map(|i| (i, full[i].clone()));
     if let Some((_, target)) = &selected {
         t.chosen = Some(target.resource);
+        t.chosen_shape = Some(shape(target));
     }
     if let Some((i, target)) = &selected {
         // SAFETY: the Arc holds this resource.
