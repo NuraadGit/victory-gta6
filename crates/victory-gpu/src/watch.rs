@@ -384,6 +384,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    // One asking fails across reservations: a window of title memory takes
+    // in many small allocations, each write-watched on its own (with the
+    // ray-tracing builder on, such windows were copied whole: 1.7 s a frame).
+    let split = if failed { by_reservation(first * PAGE, last * PAGE, &mut j.found) } else { None };
+    let failed = failed && split.is_none();
+    let split = split.unwrap_or_default();
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -407,7 +413,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let count = if split.is_empty() { count } else { 0 };
+    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded).chain(split);
     for page in pages.collect::<Vec<_>>() {
         note_written(j, page, now);
     }
@@ -542,6 +549,77 @@ pub fn title_memory_private_gone(at: usize, len: usize) -> bool {
         title_memory_remapped(at, len);
     }
     removed
+}
+
+/// `[start, end)` asked about reservation by reservation, after one asking
+/// across it failed: the pages (of [`PAGE`]) written in each since the last
+/// asking, or `None` if some committed part of it is not write-watched (or
+/// none of it is memory). A first pass only asks (no reset), so that a
+/// failure leaves every reservation's written pages for whoever asks next.
+fn by_reservation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let query = |at: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0 && info.RegionSize != 0).then_some(info)
+    };
+    // The reservations' parts in the range, in order.
+    let mut parts = Vec::new();
+    let mut at = start;
+    while at < end {
+        let info = query(at)?;
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if info.State == MEM_FREE {
+            at = region_end;
+            continue;
+        }
+        let base = info.AllocationBase as usize;
+        let mut stop = region_end;
+        while stop < end {
+            match query(stop) {
+                Some(next) if next.AllocationBase as usize == base && next.State != MEM_FREE => {
+                    stop = (next.BaseAddress as usize).saturating_add(next.RegionSize).min(end);
+                }
+                _ => break,
+            }
+        }
+        parts.push((at, stop));
+        at = stop;
+    }
+    if parts.len() < 2 {
+        // One reservation (or none): the asking across it said all there is.
+        return None;
+    }
+    for &(a, b) in &parts {
+        let (mut probe, mut count, mut granularity) = (0usize, 1usize, 0u32);
+        // SAFETY: a one-entry answer buffer; no reset.
+        let failed = unsafe {
+            GetWriteWatch(0, a as *const _, b - a, (&raw mut probe).cast(), &mut count, &mut granularity)
+        } != 0;
+        if failed {
+            return None;
+        }
+    }
+    let mut out = Vec::new();
+    for (a, b) in parts {
+        let mut count = (b - a).div_ceil(KERNEL_PAGE);
+        found.resize(count.max(found.len()), 0);
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(WRITE_WATCH_FLAG_RESET, a as *const _, b - a, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        } != 0;
+        if failed {
+            // Watched a moment ago: take it all as written rather than lose a write.
+            out.extend(a / PAGE..b.div_ceil(PAGE));
+            continue;
+        }
+        out.extend(found[..count].iter().map(|&at| at / PAGE));
+    }
+    Some(out)
 }
 
 /// Guarded blocks of view or registered private title memory.
@@ -1248,6 +1326,38 @@ mod tests {
         // SAFETY: the allocation above.
         unsafe { VirtualFree(p, 0, MEM_RELEASE) };
         title_memory_private_gone(p as usize, 2 * BLOCK);
+    }
+
+    #[test]
+    fn a_range_over_several_write_watched_reservations_is_asked_one_by_one() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // Two write-watched reservations side by side: one asking across both
+        // fails, as with title windows over many small allocations.
+        // SAFETY: a reservation, released below.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!r.is_null());
+        // SAFETY: release it to place two watched reservations in its room.
+        unsafe { VirtualFree(r, 0, MEM_RELEASE) };
+        let a = r as usize;
+        let b = a + 2 * BLOCK;
+        // SAFETY: fresh reservations at addresses just freed.
+        let pa = unsafe { VirtualAlloc(a as *const _, 2 * BLOCK, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        let pb = unsafe { VirtualAlloc(b as *const _, 2 * BLOCK, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        if pa.is_null() || pb.is_null() {
+            eprintln!("the room was taken meanwhile; skipped");
+            return;
+        }
+        let (start, end) = (a, b + 2 * BLOCK);
+        let _ = writes(start, end, false);
+        // SAFETY: inside the second reservation.
+        unsafe { std::ptr::write_volatile((b + BLOCK + 8) as *mut u8, 1) };
+        let (now, written) = writes(start, end, false).expect("asked reservation by reservation");
+        assert!(written.contains(&((b + BLOCK) / PAGE, now)), "{written:?}");
+        // SAFETY: the reservations above.
+        unsafe {
+            VirtualFree(pa, 0, MEM_RELEASE);
+            VirtualFree(pb, 0, MEM_RELEASE);
+        }
     }
 
     #[test]
