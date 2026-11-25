@@ -20,6 +20,12 @@
 //! `VICTORY_TEXTURE_BACK=<width>x<height>f<format>[,...]`: by kind instead,
 //! whatever program writes them, as the patch did at first.
 //!
+//! Only the GPU writes these textures' memory, so the title's bytes there
+//! stay what we last landed. If they changed, the title has used the memory
+//! for something else without telling us (its own heaps), and that texture
+//! is landed no more: each copy carries a hash of the title's bytes when it
+//! was recorded, and the bytes we land are hashed too ([`LANDED`]).
+//!
 //! The copy shows what the list's last write left; a title read in between
 //! sees the frame before, as it would before the console's GPU has run.
 
@@ -77,6 +83,18 @@ fn parse(value: Option<&str>) -> Mode {
     }
 }
 
+/// `VICTORY_TEXTURE_BACK_KINDS=<width>x<height>f<format>[,...]` with
+/// `VICTORY_TEXTURE_BACK=1`: of what the water programs write, only these.
+fn kinds_filter() -> Option<&'static [(u64, u32, u32)]> {
+    static KINDS: OnceLock<Option<Vec<(u64, u32, u32)>>> = OnceLock::new();
+    KINDS
+        .get_or_init(|| match parse(std::env::var("VICTORY_TEXTURE_BACK_KINDS").ok().as_deref()) {
+            Mode::Kinds(k) => Some(k),
+            _ => None,
+        })
+        .as_deref()
+}
+
 fn mode() -> &'static Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     MODE.get_or_init(|| {
@@ -112,7 +130,18 @@ pub(crate) fn preparing(hash: Option<&str>) {
 pub(crate) fn wanted(resource: This) -> bool {
     match mode() {
         Mode::Off => false,
-        Mode::Programs => WRITING.get() && crate::resource::texture_kind(resource).is_some(),
+        Mode::Programs => {
+            if !WRITING.get() {
+                return false;
+            }
+            let Some(kind) = crate::resource::texture_kind(resource) else { return false };
+            let take = kinds_filter().is_none_or(|f| f.contains(&kind));
+            static SEEN: Mutex<Option<std::collections::HashSet<(u64, u32, u32, bool)>>> = Mutex::new(None);
+            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert((kind.0, kind.1, kind.2, take)) {
+                tracing::info!(width = kind.0, height = kind.1, format = kind.2, take, "a water program writes a texture of this kind");
+            }
+            take
+        }
         Mode::Kinds(kinds) => crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k)),
     }
 }
@@ -127,6 +156,36 @@ struct Ticket {
 }
 
 static TICKETS: Mutex<Vec<Weak<Ticket>>> = Mutex::new(Vec::new());
+
+/// By title address: the end and the hash of the bytes we last landed there.
+static LANDED: Mutex<Option<std::collections::HashMap<usize, (usize, u64)>>> = Mutex::new(None);
+/// Title textures (by resource) whose memory the title changed under us.
+static DENIED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static REUSED: AtomicU64 = AtomicU64::new(0);
+
+fn hash(bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(bytes);
+    h.finish()
+}
+
+/// The title's bytes at `[at, end)` changed under us: texture `owner` is
+/// landed no more.
+fn deny(owner: usize, at: usize, end: usize, why: &str) {
+    DENIED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(owner);
+    if let Some(l) = LANDED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        l.remove(&at);
+    }
+    let n = REUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(n, owner = format_args!("{owner:#x}"), at = format_args!("{at:#x}"), bytes = end - at, why, "texture readback: the title used this memory for something else; not landed again");
+    }
+}
+
+fn denied(owner: usize) -> bool {
+    DENIED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|d| d.contains(&owner))
+}
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 fn track(owner: usize, at: usize, end: usize) -> Arc<Ticket> {
@@ -153,6 +212,9 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
 
 pub(crate) fn released(owner: usize) {
     invalidate(|ticket| ticket.owner == owner);
+    if let Some(d) = DENIED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        d.remove(&owner);
+    }
 }
 
 pub(crate) fn replaced(at: usize) {
@@ -168,6 +230,8 @@ pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+    /// The hash of the title's bytes when the copy was recorded.
+    before: u64,
 }
 
 impl Target {
@@ -177,8 +241,24 @@ impl Target {
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
+        if denied(resource as usize) {
+            return None;
+        }
+        let mut now = vec![0u8; end - at];
+        if !crate::host::read_into(at as *const u8, &mut now) {
+            return None;
+        }
+        let before = hash(&now);
+        let last = LANDED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&at).copied());
+        if let Some((last_end, last)) = last
+            && last_end == end
+            && last != before
+        {
+            deny(resource as usize, at, end, "changed since we landed");
+            return None;
+        }
         let ticket = track(resource as usize, at, end);
-        Some(Self { copy, layout, ticket })
+        Some(Self { copy, layout, ticket, before })
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
@@ -192,6 +272,7 @@ pub(crate) struct Back {
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+    before: u64,
 }
 
 impl Back {
@@ -254,10 +335,16 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket, before: target.before })
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
+/// `VICTORY_TEXTURE_BACK_GUARD=0`: land without checking the title's bytes.
+fn guarded() -> bool {
+    static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BACK_GUARD").is_none_or(|v| v != "0"))
+}
+
 fn quiet() -> bool {
     static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *QUIET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BACK_QUIET").is_some_and(|v| v == "1"))
@@ -287,6 +374,16 @@ pub(crate) fn land(back: &Back) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    if guarded() {
+        // What we recorded over, or what an earlier copy of the same
+        // texture has landed since.
+        let now = hash(&tiled);
+        let landed = LANDED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&at).copied());
+        if now != back.before && landed.is_none_or(|(e, h)| e != end || h != now) {
+            deny(back.ticket.owner, at, end, "changed while the copy ran");
+            return;
+        }
+    }
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
@@ -313,6 +410,9 @@ pub(crate) fn land(back: &Back) {
     unsafe { back.buffer.Unmap(0, None) };
     // VICTORY_TEXTURE_BACK_DRY=1: the copies run and are tiled, the title's
     // memory is left as it was (does the copy or the title's use of it hang?).
+    if guarded() && (quiet() || !dry()) {
+        LANDED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(at, (end, hash(&tiled)));
+    }
     if quiet() {
         crate::watch::writing_quiet(at, size);
         crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, false);
