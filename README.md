@@ -1,5 +1,7 @@
 # VIctory fork (work in progress)
 
+> **RTX 2080 / 8 GB NVIDIA testers:** this is the `rtx2080` branch; see [RTX2080.md](RTX2080.md) for the settings and what to expect.
+
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
 files the user supplies. This fork follows upstream
