@@ -19,16 +19,22 @@
 mod alias;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod drvwatch;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framelog;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -51,6 +57,8 @@ pub fn detect_host_wave() -> bool {
     #[cfg(not(windows))]
     false
 }
+#[cfg(windows)]
+mod plaincopy;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
