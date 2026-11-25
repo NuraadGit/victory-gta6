@@ -1280,6 +1280,13 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// [`writing`] without queueing the range for the texture slots: for our
+/// own write of bytes a texture's host copy already holds (`crate::texback`
+/// with `VICTORY_TEXTURE_BACK_QUIET=1`).
+pub(crate) fn writing_quiet(at: usize, len: usize) {
+    open(&mut guards(), at, at.saturating_add(len));
+}
+
 /// The runtime wrote title memory `[at, at + len)` through another view of
 /// its pages ([`title_memory_written`] with `pages`) (the guards never see such a write): its pages count as
 /// written, so the copies of that memory take the new bytes, and only those
