@@ -9,6 +9,8 @@
 
 use std::ffi::{CStr, c_void};
 
+#[cfg(windows)]
+use super::xmem::VirtualFree;
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
@@ -357,12 +359,15 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
+            #[cfg(windows)]
+            hle_export!(VirtualFree),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),

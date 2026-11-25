@@ -6,7 +6,8 @@
 //! buffers), so what one asks is kept here for the others: a journal of
 //! each page's last write, numbered by the asking.
 //!
-//! Physical-page views (xmem's sections) cannot be write-watched. There a
+//! Physical-page views (xmem's sections) and private title allocations not
+//! reserved with write watching cannot be write-watched. There a
 //! copy leaves each 64 KiB block it took read-only, and our vectored handler
 //! takes the first write to it: it notes the block as written and gives the
 //! write access back. The runtime tells us when it maps or unmaps views
@@ -350,7 +351,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
+/// with `guarded`, views or registered private title memory, then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
@@ -419,7 +420,109 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
-/// Guarded blocks of view memory.
+/// Private title allocations without kernel write watching: disjoint, coalesced
+/// `[start, end)` byte ranges. Only XMem's virtual allocations belong here;
+/// its host-heap suballocations must never be rounded out to guarded blocks.
+///
+/// The handler never reads this map. Lookups finish before `guards()` is
+/// taken, and mutations never hold this mutex across guard/journal work.
+/// Thus a fault cannot wait on a registry lock held by its own thread, nor
+/// introduce a registry/guards lock cycle. The nodes live on the host heap,
+/// which is not registered or guarded.
+static PRIVATE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// The runtime committed private title memory without `MEM_WRITE_WATCH`.
+/// Call only for whole kernel pages owned exclusively by the title, never
+/// host-heap suballocations. Mapping/free notifications revoke membership
+/// through [`title_memory_remapped`] or [`title_memory_private_gone`].
+pub fn title_memory_private(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut ranges = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut start, mut end) = (at, at.saturating_add(len));
+    if let Some((&a, &b)) = ranges.range(..=start).next_back()
+        && b >= start
+    {
+        start = a;
+        end = end.max(b);
+        ranges.remove(&a);
+    }
+    while let Some((&a, &b)) = ranges.range(start..=end).next() {
+        end = end.max(b);
+        ranges.remove(&a);
+    }
+    ranges.insert(start, end);
+}
+
+/// Removes just the overlap, retaining either side of a partial decommit.
+fn private_remove(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let mut ranges = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = false;
+    while let Some((&a, &b)) = ranges.range(..end).next_back() {
+        if b <= at {
+            break;
+        }
+        ranges.remove(&a);
+        if a < at {
+            ranges.insert(a, at);
+        }
+        if b > end {
+            ranges.insert(end, b);
+        }
+        removed = true;
+    }
+    removed
+}
+
+/// `Some(true)` if the entire range is private title memory; `Some(false)`
+/// if it starts there but extends outside it; `None` otherwise. In particular,
+/// a known first guard must not authorize protecting adjacent host memory.
+fn private_range(start: usize, end: usize) -> Option<bool> {
+    let ranges = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    ranges
+        .range(..=start)
+        .next_back()
+        .filter(|&(_, &b)| start < b)
+        .map(|(_, &b)| end <= b)
+}
+
+/// Before a title free/decommit: open any guards on registered private
+/// memory, but retain ownership until the host reports success. In particular,
+/// a 4 KiB decommit must not strand the rest of a 64 KiB guard read-only after
+/// its guard record is discarded. Unregistered memory is left alone.
+pub fn title_memory_private_freeing(at: usize, len: usize) {
+    let overlaps = len != 0 && {
+        let ranges = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+        ranges
+            .range(..at.saturating_add(len))
+            .next_back()
+            .is_some_and(|(_, &b)| b > at)
+    };
+    if overlaps {
+        writing(at, len);
+        crate::inplace::title_memory_freeing(at, len);
+    }
+}
+
+/// The runtime successfully freed/decommitted private title memory. Unlike
+/// `title_memory_remapped`, does nothing for memory not registered here.
+/// The pages are already gone (or replaced and read-write); it must not be
+/// used to abandon guards on a live read-only allocation. Returns whether
+/// any private registration was removed.
+pub fn title_memory_private_gone(at: usize, len: usize) -> bool {
+    let removed = private_remove(at, len);
+    if removed {
+        title_memory_remapped(at, len);
+    }
+    removed
+}
+
+/// Guarded blocks of view or registered private title memory.
 const BLOCK: usize = PAGE;
 
 struct Guards {
@@ -502,10 +605,15 @@ impl Drop for Held {
     }
 }
 
-/// For view memory: the pages of `[start, end)`'s blocks written since
-/// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the memory is not a view.
+/// For views or registered private title memory: the pages of `[start, end)`'s
+/// blocks written since they were last guarded, guarding them again
+/// before the caller copies them. `None` if the memory is not eligible.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    // Resolve private ownership before taking GUARDS; never from the handler.
+    let private = private_range(start, end);
+    if private == Some(false) {
+        return None;
+    }
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -514,12 +622,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
-    if !known && !is_view(start, end) {
+    let known =
+        !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+            let g = guards();
+            let first = start / BLOCK;
+            g.protected.contains(&first) || g.absent.contains(&first)
+        };
+    if !known && private != Some(true) && !is_view(start, end) {
         return None;
     }
     install();
@@ -624,7 +733,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
+        // SAFETY: title view or registered private memory; only its protection changes.
         unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
@@ -671,19 +780,25 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    let mut opened = false;
+    // Also called by the exception handler: no Vec, allocation or TLS.
+    while let Some(&block) = g.protected.range(range.clone()).next() {
+        let mut old = 0;
+        // SAFETY: a block we made read-only. Requesting PAGE_READWRITE may
+        // drop PAGE_WRITECOMBINE (Windows can retain the allocation's cache
+        // policy). That is harmless: the GPU reads host copies, never this
+        // memory directly; cached CPU writes remain visible to those copies.
+        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) }
+            == 0
+        {
+            break;
+        }
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        opened = true;
     }
-    !blocks.is_empty()
+    opened
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -803,6 +918,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    private_remove(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -846,15 +962,22 @@ fn install() {
             // This thread holds the guards (a fault inside a copy's own
             // work): a block it made read-only is opened here, without the
             // lock, and noted when the lock is given back ([`Held`]).
-            use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+            use windows_sys::Win32::System::Memory::{
+                PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
+            };
             let block = at / BLOCK;
             if read_only(at) {
                 let mut old = 0;
                 // SAFETY: a block we made read-only (read-only data memory
                 // in a block this thread is guarding); only its protection
                 // changes.
-                let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 };
-                if done && old == PAGE_READONLY {
+                let done = unsafe {
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+                        != 0
+                };
+                if done
+                    && old & !windows_sys::Win32::System::Memory::PAGE_WRITECOMBINE == PAGE_READONLY
+                {
                     let n = OPENED_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     if let Some(slot) = OPENED_HELD.get(n) {
                         slot.store(block + 1, std::sync::atomic::Ordering::Release);
@@ -886,8 +1009,8 @@ fn install() {
     });
 }
 
-/// Whether `at` is committed read-only data memory (what we guard: views,
-/// and private memory beside them; never an image's code or constants).
+/// Whether `at` is committed read-only data memory (what we guard: views
+/// and registered private title memory; never an image's code or constants).
 fn read_only(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
@@ -896,7 +1019,10 @@ fn read_only(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Type != MEM_IMAGE && info.Protect == PAGE_READONLY
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Type != MEM_IMAGE
+        && info.Protect & !windows_sys::Win32::System::Memory::PAGE_WRITECOMBINE == PAGE_READONLY
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -908,7 +1034,7 @@ fn writable(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    n != 0 && info.State == MEM_COMMIT && info.Protect & !windows_sys::Win32::System::Memory::PAGE_WRITECOMBINE == PAGE_READWRITE
 }
 
 #[cfg(test)]
@@ -918,6 +1044,152 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Dedicated VirtualAlloc blocks: never register Rust's host heap.
+    struct PrivateBlock {
+        at: usize,
+        len: usize,
+    }
+
+    impl PrivateBlock {
+        fn new(blocks: usize, protection: u32) -> Self {
+            let len = blocks * BLOCK;
+            // SAFETY: a new, whole reservation, owned until Drop.
+            let at = unsafe {
+                VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, protection)
+            } as usize;
+            assert_ne!(at, 0, "{}", std::io::Error::last_os_error());
+            Self { at, len }
+        }
+    }
+
+    impl Drop for PrivateBlock {
+        fn drop(&mut self) {
+            // Forget query results before addresses can be reused by another test.
+            {
+                let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+                for page in self.at / PAGE..(self.at + self.len) / PAGE {
+                    j.written.remove(&page);
+                    j.exact.remove(&page);
+                }
+            }
+            // SAFETY: our entire allocation. Releasing read-only memory is legal.
+            assert_ne!(unsafe { VirtualFree(self.at as _, 0, MEM_RELEASE) }, 0);
+            title_memory_private_gone(self.at, self.len);
+            title_memory_remapped(self.at, self.len);
+        }
+    }
+
+    #[test]
+    fn registered_private_title_writes_are_reported() {
+        let p = PrivateBlock::new(2, PAGE_READWRITE);
+        title_memory_private(p.at, p.len);
+        let (before, initial) =
+            writes(p.at, p.at + p.len, true).expect("private title memory guarded");
+        assert_eq!(initial, [(p.at / PAGE, before), (p.at / PAGE + 1, before)]);
+        assert!(read_only(p.at));
+        let (_, clean) = writes(p.at, p.at + p.len, true).unwrap();
+        assert_eq!(clean, initial, "no newer writes");
+        // Holding the registry while faulting proves the handler never locks it.
+        let registry = PRIVATE.lock().unwrap();
+        // SAFETY: inside our committed block; the handler opens it on first write.
+        unsafe { ((p.at + BLOCK + 8) as *mut u8).write_volatile(7) };
+        drop(registry);
+        let (now, after) = writes(p.at, p.at + p.len, true).unwrap();
+        assert_eq!(after, [(p.at / PAGE, before), (p.at / PAGE + 1, now)]);
+        assert!(now > before);
+    }
+
+    #[test]
+    fn private_memory_outside_the_title_registration_is_not_guarded() {
+        let p = PrivateBlock::new(2, PAGE_READWRITE);
+        title_memory_private(p.at, BLOCK);
+        // A positive control also makes this regression fail without private guards.
+        assert!(writes(p.at, p.at + BLOCK, true).is_some());
+        assert!(writes(p.at + BLOCK, p.at + p.len, true).is_none());
+        assert!(writable(p.at + BLOCK));
+        // A known first guard cannot authorize protecting an unregistered tail.
+        assert!(writes(p.at, p.at + p.len, true).is_none());
+        assert!(writable(p.at + BLOCK));
+    }
+
+    #[test]
+    fn write_combined_private_title_memory_is_guarded_and_opened() {
+        use windows_sys::Win32::System::Memory::PAGE_WRITECOMBINE;
+        let p = PrivateBlock::new(2, PAGE_READWRITE | PAGE_WRITECOMBINE);
+        title_memory_private(p.at, p.len);
+        assert!(writes(p.at, p.at + p.len, true).is_some());
+        assert!(read_only(p.at));
+        // The explicit kernel-write path opens WC-backed private pages too.
+        writing(p.at, 1);
+        assert!(writable(p.at));
+        // SAFETY: inside our now writable allocation.
+        unsafe { (p.at as *mut u8).write_volatile(1) };
+        let (now, after) = writes(p.at, p.at + p.len, true).unwrap();
+        assert_eq!(after[0], (p.at / PAGE, now));
+        // Both locks held: the reentrant handler path must use neither mutex,
+        // allocate nothing, and settle the opened block when Held is dropped.
+        let registry = PRIVATE.lock().unwrap();
+        {
+            let g = guards();
+            // SAFETY: inside the second guarded block of our allocation.
+            unsafe { ((p.at + BLOCK + 8) as *mut u8).write_volatile(2) };
+            assert!(g.protected.contains(&(p.at / BLOCK + 1)));
+        }
+        drop(registry);
+        assert!(writable(p.at + BLOCK));
+        let (now, after) = writes(p.at, p.at + p.len, true).unwrap();
+        assert_eq!(after[1], (p.at / PAGE + 1, now));
+    }
+
+    #[test]
+    fn private_registration_coalesces_and_partial_decommit_splits_it() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        let p = PrivateBlock::new(4, PAGE_READWRITE);
+        title_memory_private(p.at, BLOCK);
+        title_memory_private(p.at + 2 * BLOCK, 2 * BLOCK);
+        title_memory_private(p.at + BLOCK, 2 * BLOCK); // bridge and overlap
+        assert_eq!(private_range(p.at, p.at + p.len), Some(true));
+        assert!(writes(p.at, p.at + p.len, true).is_some());
+        // SAFETY: decommit exactly the middle block of our reservation.
+        assert_ne!(
+            unsafe { VirtualFree((p.at + BLOCK) as _, BLOCK, MEM_DECOMMIT) },
+            0
+        );
+        title_memory_private_gone(p.at + BLOCK, BLOCK);
+        assert_eq!(private_range(p.at, p.at + BLOCK), Some(true));
+        assert_eq!(private_range(p.at + BLOCK, p.at + 2 * BLOCK), None);
+        assert_eq!(private_range(p.at + 2 * BLOCK, p.at + p.len), Some(true));
+        // Reuse the hole as unregistered private memory; no stale guard may win.
+        assert_eq!(
+            unsafe { VirtualAlloc((p.at + BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) }
+                as usize,
+            p.at + BLOCK
+        );
+        assert!(writes(p.at + BLOCK, p.at + 2 * BLOCK, true).is_none());
+        assert!(writable(p.at + BLOCK));
+    }
+
+    #[test]
+    fn private_subpage_decommit_opens_surviving_guard_pages() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        let p = PrivateBlock::new(2, PAGE_READWRITE);
+        title_memory_private(p.at, p.len);
+        assert!(writes(p.at, p.at + p.len, true).is_some());
+        title_memory_private_freeing(p.at, KERNEL_PAGE);
+        // SAFETY: decommit one kernel page of our allocation, not a whole guard.
+        assert_ne!(unsafe { VirtualFree(p.at as _, KERNEL_PAGE, MEM_DECOMMIT) }, 0);
+        assert!(title_memory_private_gone(p.at, KERNEL_PAGE));
+        assert!(writable(p.at + KERNEL_PAGE));
+        // SAFETY: a surviving page must not retain an orphaned read-only guard.
+        unsafe { ((p.at + KERNEL_PAGE) as *mut u8).write_volatile(3) };
+        // The neighboring whole guard is unaffected and still reports a fault.
+        assert!(read_only(p.at + BLOCK));
+        // SAFETY: inside the neighboring committed block; the handler opens it.
+        unsafe { ((p.at + BLOCK) as *mut u8).write_volatile(4) };
+        let (now, after) = writes(p.at + BLOCK, p.at + p.len, true).unwrap();
+        assert_eq!(after, [(p.at / PAGE + 1, now)]);
+    }
 
     #[test]
     fn a_write_fault_while_the_guards_are_held_does_not_wait_for_them() {

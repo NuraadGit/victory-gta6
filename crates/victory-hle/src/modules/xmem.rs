@@ -17,11 +17,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_DECOMMIT, MEM_EXTENDED_PARAMETER,
+    MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree as host_virtual_free,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -107,9 +108,6 @@ pub extern "system" fn XMemVirtualAlloc(
     };
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`); on the host only a placeholder can.
-    // shortcut: committing part of such a reservation later would fail
-    // (the title's 23 calls never do); replace that part of the
-    // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
@@ -131,7 +129,7 @@ pub extern "system" fn XMemVirtualAlloc(
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
+        // watched (their physical-page views use read-only guards).
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             kind |= MEM_WRITE_WATCH;
         }
@@ -153,6 +151,19 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        // Includes placeholder replacements and commits into reservations
+        // at title-chosen addresses. The reservation, not this call's flags,
+        // determines whether kernel write watching exists.
+        let offset = if base.is_null() {
+            0
+        } else {
+            base as usize - at as usize
+        };
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        register_private(at, size.saturating_add(offset));
+        unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -163,6 +174,83 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     at
+}
+
+/// Register only private committed pages that lack kernel write watching.
+/// `GetWriteWatch` with flags 0 queries one page without resetting any dirty
+/// bits, including when this commit names an older write-watched reservation.
+fn register_private(at: *mut c_void, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const KERNEL_PAGE: usize = 4096;
+    // SAFETY: plain query output and a current-process pseudo handle.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQueryEx(GetCurrentProcess(), at, &mut info, size_of_val(&info)) } == 0
+        || info.State != MEM_COMMIT
+        || info.Type != MEM_PRIVATE
+    {
+        return false;
+    }
+    let (mut found, mut count, mut granularity) = (std::ptr::null_mut(), 1, 0);
+    // SAFETY: one entry for a query of one committed kernel page.
+    if unsafe { GetWriteWatch(0, at, KERNEL_PAGE, &mut found, &mut count, &mut granularity) } == 0 {
+        return false;
+    }
+    let len = len.saturating_add(KERNEL_PAGE - 1) / KERNEL_PAGE * KERNEL_PAGE;
+    victory_gpu::title_memory_private(at as usize, len);
+    true
+}
+
+/// Title frees otherwise pass straight to Windows. Forget private ownership
+/// only after a successful release/decommit, so a failed free stays watched.
+/// This wrapper is also exported by the kernel module for Windows imports.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    let previous_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    // With MEM_RELEASE or MEM_DECOMMIT and size 0 Windows frees the whole reservation,
+    // whose committed/protected regions can have different query answers.
+    let mut at = address as usize;
+    let mut len = size;
+    if kind & (MEM_RELEASE | MEM_DECOMMIT) != 0 && size == 0 {
+        // SAFETY: plain query output and a current-process pseudo handle.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQueryEx(GetCurrentProcess(), address, &mut info, size_of_val(&info)) }
+            != 0
+        {
+            at = info.AllocationBase as usize;
+            let mut end = at;
+            loop {
+                // SAFETY: valid query output; querying an invalid address just fails.
+                if unsafe {
+                    VirtualQueryEx(GetCurrentProcess(), end as _, &mut info, size_of_val(&info))
+                } == 0
+                    || info.AllocationBase as usize != at
+                {
+                    break;
+                }
+                let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+                if next <= end {
+                    break;
+                }
+                end = next;
+            }
+            len = end.saturating_sub(at);
+        }
+    } else {
+        // Decommit rounds down the start and up the end to kernel pages.
+        at &= !4095;
+        len = (address as usize).saturating_add(size).saturating_add(4095) / 4096 * 4096 - at;
+    }
+    victory_gpu::title_memory_private_freeing(at, len);
+    // Queries must not change the LastError seen by a successful host call.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(previous_error) };
+    // SAFETY: forward the title's original arguments unchanged.
+    let done = unsafe { host_virtual_free(address, size, kind) };
+    // Notifications can change LastError; preserve the host API's value.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if done != 0 && kind & (MEM_RELEASE | MEM_DECOMMIT) != 0 {
+        victory_gpu::title_memory_private_gone(at, len);
+    }
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    done
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -743,7 +831,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
     let view = unsafe {
-        VirtualFree(
+        host_virtual_free(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
@@ -1015,6 +1103,131 @@ mod tests {
     }
 
     #[test]
+    fn chosen_base_private_commits_and_placeholder_replacements_are_registered() {
+        // A title-chosen reservation without MEM_WRITE_WATCH.
+        // SAFETY: a new reservation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!p.is_null());
+        assert_eq!(
+            XMemVirtualAlloc(p, 2 * PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            p
+        );
+        assert!(
+            victory_gpu::title_memory_private_gone(p as usize, PAGE),
+            "XMem committed and registered it"
+        );
+        assert!(register_private(p, PAGE));
+        // Failed frees must preserve the allocation and its registration.
+        assert_eq!(VirtualFree(p, PAGE, MEM_RELEASE), 0);
+        assert_eq!(query(p).host.State, MEM_COMMIT);
+        assert!(
+            victory_gpu::title_memory_private_gone(p as usize, PAGE),
+            "failed free retained registration"
+        );
+        assert!(register_private(p, PAGE));
+        assert_ne!(VirtualFree(p, PAGE, MEM_DECOMMIT), 0);
+        assert!(
+            !victory_gpu::title_memory_private_gone(p as usize, PAGE),
+            "decommit removed registration"
+        );
+        let second = p.wrapping_byte_add(PAGE);
+        assert!(
+            victory_gpu::title_memory_private_gone(second as usize, PAGE),
+            "partial decommit retained its neighbor"
+        );
+        assert!(register_private(second, PAGE));
+        assert_eq!(query(p).host.State, MEM_RESERVE);
+        assert_eq!(
+            XMemVirtualAlloc(p, PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            p
+        );
+        // Windows accepts size 0 to decommit the entire reservation too.
+        assert_ne!(VirtualFree(p, 0, MEM_DECOMMIT), 0);
+        assert_eq!(query(p).host.State, MEM_RESERVE);
+        assert!(
+            !victory_gpu::title_memory_private_gone(p as usize, 2 * PAGE),
+            "whole decommit removed both registrations"
+        );
+        assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
+
+        let placeholder = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            PAGES_64K | MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!placeholder.is_null());
+        assert_eq!(
+            XMemVirtualAlloc(
+                placeholder,
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                GRAPHICS,
+                PAGE_READWRITE
+            ),
+            placeholder
+        );
+        assert_eq!(query(placeholder).host.Type, MEM_PRIVATE);
+        assert!(
+            victory_gpu::title_memory_private_gone(placeholder as usize, PAGE),
+            "placeholder replacement registered"
+        );
+        assert!(register_private(placeholder, PAGE));
+        assert_ne!(VirtualFree(placeholder, 0, MEM_RELEASE), 0);
+        assert!(
+            !victory_gpu::title_memory_private_gone(placeholder as usize, PAGE),
+            "release removed registration"
+        );
+
+        // A later commit at a chosen address in a watched reservation must
+        // keep its kernel dirty bits and must not acquire private guards.
+        let watched = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!watched.is_null());
+        assert_eq!(
+            XMemVirtualAlloc(watched, PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            watched
+        );
+        // SAFETY: our committed page.
+        unsafe { watched.cast::<u8>().write_volatile(3) };
+        assert!(!register_private(watched, PAGE));
+        assert!(!victory_gpu::title_memory_private_gone(
+            watched as usize,
+            PAGE
+        ));
+        let (mut found, mut count, mut granularity) = (std::ptr::null_mut(), 1, 0);
+        assert_eq!(
+            unsafe {
+                windows_sys::Win32::System::Memory::GetWriteWatch(
+                    0,
+                    watched,
+                    4096,
+                    &mut found,
+                    &mut count,
+                    &mut granularity,
+                )
+            },
+            0
+        );
+        assert_eq!(count, 1, "registration probe did not reset the dirty bit");
+        assert_ne!(VirtualFree(watched, 0, MEM_RELEASE), 0);
+        assert_eq!(
+            crate::registry::lookup("kernel32.dll", "VirtualFree"),
+            Some(VirtualFree as *const () as usize)
+        );
+        assert_eq!(
+            crate::registry::lookup("api-ms-win-core-memory-l1-1-0.dll", "VirtualFree"),
+            Some(VirtualFree as *const () as usize)
+        );
+    }
+
+    #[test]
     fn virtual_alloc_meets_console_constraints() {
         const GPU_READ_WRITE: u32 = 0x2000;
         let p = XMemVirtualAlloc(
@@ -1046,7 +1259,7 @@ mod tests {
         };
         assert_eq!(watched, 0);
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -1060,7 +1273,7 @@ mod tests {
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
     }
 
     #[test]
