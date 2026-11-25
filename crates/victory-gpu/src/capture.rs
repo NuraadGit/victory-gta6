@@ -55,7 +55,33 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || triggered(n)
+}
+
+/// A file `dump-next` in the capture folder, made while the game runs: the
+/// frame being built then is listed (saved, and with `VICTORY_DUMP_TARGETS`
+/// its targets dumped), and the file is removed. To look at a scene reached
+/// by playing, which no frame number names ahead of time.
+fn triggered(n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ARMED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static CHECKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    if ARMED.load(Relaxed) == n {
+        return true;
+    }
+    // At most one look at the folder per frame number.
+    if CHECKED.swap(n, Relaxed) == n {
+        return false;
+    }
+    let Some(file) = folder().map(|f| f.join("dump-next")) else {
+        return false;
+    };
+    if file.exists() && std::fs::remove_file(&file).is_ok() {
+        ARMED.store(n, Relaxed);
+        tracing::info!(frame = n, "capture: dump-next found, this frame is saved");
+        return true;
+    }
+    false
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
