@@ -510,3 +510,42 @@ fn a_masked_f64_population_count_lowers_on_a_32_lane_host() {
         assert_eq!((u64::from(high) << 32), (count as f64).to_bits());
     }
 }
+
+/// Uniform control flow joins a mask operation's SCC with a scalar test's SCC.
+/// In local mode that is this host half's SCC, like its reductions.
+/// Compile and validate only; no GPU dispatch.
+#[test]
+fn a_local_wave_can_join_a_mask_scc_with_a_scalar_test() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xD765_0002, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v2, -1, 0: needs console lanes
+        0xBF06_8701, // s_cmp_eq_u32 s1, 7
+        0xBF85_0002, // s_cbranch_scc1 to the mask operation
+        0xBF06_8902, // s_cmp_eq_u32 s2, 9
+        0xBF82_0002, // s_branch to the join
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF85_0002, // s_cbranch_scc1 to "seven"
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0xBF82_0001, // s_branch over "seven"
+        0x7E0A_0282, // seven: v_mov_b32 v5, 2
+        0xE070_0000, 0x8002_0500, // buffer_store_dword v5, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, true, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let local = lower::with_local_waves(|| lower::lower(&lower::Parts {
+        native: &native, p: &p, st: &st, io: &io, res: &res,
+        inputs: Vec::new(), outputs: Vec::new(), prims: Vec::new(), mesh_stride: 0,
+    }));
+    lower::TEST_HOST_WAVE.set(was);
+    let local = local.expect("local-wave SCC join");
+    assert_eq!(local.wave_size, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut local.dxil.clone()).expect("DXIL validation failed");
+        eprintln!("validated the local-wave SCC join; no dispatch");
+    }
+}
